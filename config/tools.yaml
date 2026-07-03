@@ -69,6 +69,7 @@ msgElementLimit: 50 # 全局单条转发消息最大元素数（图+文混合）
 
 xiaohongshuCookie: '' # 2024-8-2后反馈必须使用ck，不然无法解析
 kugouApiServer: '' # 酷狗开源API服务地址，参考 KuGouMusicApi 默认端口
+kugouAudioQuality: viper_clear # 酷狗解析优先音质：viper_clear=Hi-Res, flac=无损FLAC, 320=高品320K, 128=普通128K
 kugouCookie: '' # 酷狗开源API搜索时使用的cookie，文档示例：token=xxx;userid=xxx;dfid=xxx
 
 weiboCookie: '' # 微博Cookie，格式：_T_WM=xxx; WEIBOCN_FROM=xxx; MLOGIN=xxx; XSRF-TOKEN=xxx; M_WEIBOCN_PARAMS=xxx

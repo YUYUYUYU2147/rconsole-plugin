@@ -1,6 +1,6 @@
 import _ from "lodash";
 import path from "path";
-import { BILI_CDN_SELECT_LIST, BILI_DEFAULT_CDN_LIST, BILI_DOWNLOAD_METHOD, BILI_RESOLUTION_LIST, VIDEO_CODEC_LIST, YOUTUBE_GRAPHICS_LIST, NETEASECLOUD_QUALITY_LIST, DOUYIN_BGM_SEND_TYPE, DOUYIN_COMMENT_COUNT_LIST, DOUYIN_COMMENT_CHUNK_SIZE_LIST, BILI_COMMENT_COUNT_LIST, BILI_COMMENT_CHUNK_SIZE_LIST, LINK_SUMMARY_RESOLVE_MODE_LIST } from "./constants/constant.js";
+import { BILI_CDN_SELECT_LIST, BILI_DEFAULT_CDN_LIST, BILI_DOWNLOAD_METHOD, BILI_RESOLUTION_LIST, VIDEO_CODEC_LIST, YOUTUBE_GRAPHICS_LIST, NETEASECLOUD_QUALITY_LIST, KUGOU_QUALITY_LIST, DOUYIN_BGM_SEND_TYPE, DOUYIN_COMMENT_COUNT_LIST, DOUYIN_COMMENT_CHUNK_SIZE_LIST, BILI_COMMENT_COUNT_LIST, BILI_COMMENT_CHUNK_SIZE_LIST, LINK_SUMMARY_RESOLVE_MODE_LIST } from "./constants/constant.js";
 import { RESOLVE_CONTROLLER_NAME_ENUM } from "./constants/resolve.js";
 import model from "./model/config.js";
 
@@ -738,6 +738,16 @@ export function supportGuoba() {
                     componentProps: {
                         placeholder: "请输入酷狗开源API地址",
                     },
+                },
+                {
+                    field: "tools.kugouAudioQuality",
+                    label: "酷狗解析音质",
+                    bottomHelpMessage:
+                        "酷狗歌曲解析优先选择的音质，若目标歌曲不支持则自动降级",
+                    component: "Select",
+                    componentProps: {
+                        options: KUGOU_QUALITY_LIST,
+                    }
                 },
                 {
                     field: "tools.kugouCookie",
