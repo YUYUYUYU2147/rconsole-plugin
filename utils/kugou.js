@@ -864,7 +864,7 @@ export async function resolveKugouMusicSource(apiServer, { message = "", kugouCo
             cover = cover || officialSongInfo?.cover || "";
             albumId = albumId || officialSongInfo?.albumId || "";
             albumAudioId = albumAudioId || officialSongInfo?.albumAudioId || "";
-            musicInfo = musicInfo || officialSongInfo?.audioName || createKugouFileName(songName, singerName, hash);
+            musicInfo = officialSongInfo?.audioName || musicInfo || createKugouFileName(songName, singerName, hash);
         } catch (error) {
             warnings.push(buildKugouWarning("根据官方歌曲信息补全元数据失败", error));
         }
