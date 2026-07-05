@@ -532,29 +532,35 @@ export async function getKugouSongUrl(apiServer, { hash, albumId = "", albumAudi
     const requestCookie = mergeCookies(cookie, registerResp.cookie);
     const qualityList = buildKugouQualityFallbackList(quality);
     const errors = [];
-    let requestHash = hash;
     let requestAlbumId = albumId;
     let requestAlbumAudioId = albumAudioId;
+    let songInfo = null;
 
     try {
-        const songInfo = await getKugouSongInfoByHash(hash, albumId, albumAudioId);
-        requestHash = pickKugouQualityHash(songInfo, quality, hash);
+        songInfo = await getKugouSongInfoByHash(hash, albumId, albumAudioId);
         requestAlbumId = songInfo?.albumId || albumId;
         requestAlbumAudioId = songInfo?.albumAudioId || albumAudioId;
-    } catch {
-        requestHash = hash;
-    }
+    } catch {}
 
     for (const qualityItem of qualityList) {
+        const currentRequestHash = songInfo
+            ? pickKugouQualityHash(songInfo, qualityItem, hash)
+            : hash;
         const params = {
-            hash: requestHash,
+            hash: currentRequestHash,
             free_part: freePart,
             quality: qualityItem,
             ...(requestAlbumId ? { album_id: requestAlbumId } : {}),
             ...(requestAlbumAudioId ? { album_audio_id: requestAlbumAudioId } : {}),
         };
 
-        const response = await requestKugouApi(apiServer, "/song/url", params, requestCookie);
+        let response = null;
+        try {
+            response = await requestKugouApi(apiServer, "/song/url", params, requestCookie);
+        } catch (error) {
+            errors.push(`${getKugouQualityLabel(qualityItem)}：${error.message}`);
+            continue;
+        }
         const url = findPlayableUrl(response.data);
         if (!url) {
             const errorMessage = findFieldDeep(response.data, ["error", "msg", "message"]) || "未返回音源地址";
@@ -575,7 +581,7 @@ export async function getKugouSongUrl(apiServer, { hash, albumId = "", albumAudi
             quality: qualityItem,
             qualityLabel: getKugouQualityLabel(qualityItem),
             cookie: response.cookie,
-            requestHash,
+            requestHash: currentRequestHash,
             error: findFieldDeep(response.data, ["error", "msg", "message"]),
         };
     }
@@ -937,6 +943,7 @@ export async function resolveKugouMusicSource(apiServer, { message = "", kugouCo
                 cover = urlResult.cover || candidate.cover || cover;
                 url = urlResult.url || "";
                 audioType = urlResult.audioType || audioType;
+                qualityLabel = urlResult.qualityLabel || qualityLabel;
                 size = urlResult.size || size;
                 musicInfo = candidate.audioName || createKugouFileName(songName, singerName, hash);
             }
