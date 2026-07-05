@@ -364,6 +364,7 @@ export class tools extends plugin {
         // 酷狗开源API配置
         this.kugouApiServer = this.toolsConfig.kugouApiServer;
         this.kugouCookie = this.toolsConfig.kugouCookie;
+        this.kugouAudioQuality = this.toolsConfig.kugouAudioQuality || 'viper_clear';
         // 加载是否自建服务器
         this.useLocalNeteaseAPI = this.toolsConfig.useLocalNeteaseAPI;
         // 加载自建服务器API
@@ -4195,6 +4196,7 @@ export class tools extends plugin {
         const kugouResult = await resolveKugouMusicSource(this.kugouApiServer, {
             message: url,
             kugouCookie: this.kugouCookie,
+            quality: this.kugouAudioQuality,
         });
         for (const warning of kugouResult.warnings || []) {
             logger.warn(`[R插件][kugouMusic] ${warning}`);
@@ -4216,7 +4218,7 @@ export class tools extends plugin {
             cover: kugouResult.cover,
             songName: kugouResult.songName,
             singerName: kugouResult.singerName,
-            size: kugouResult.size,
+            size: kugouResult.qualityLabel || kugouResult.size,
             musicType: ["酷狗音乐"]
         });
         const img = await puppeteer.screenshot("neteaseMusicInfo", cardData);

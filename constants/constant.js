@@ -289,6 +289,13 @@ export const NETEASECLOUD_QUALITY_LIST = Object.freeze([
     { label: '超清母带', value: 'jymaster' },
 ]);
 
+export const KUGOU_QUALITY_LIST = Object.freeze([
+    { label: 'Hi-Res', value: 'viper_clear' },
+    { label: '无损 FLAC', value: 'flac' },
+    { label: '高品 320K', value: '320' },
+    { label: '普通 128K', value: '128' },
+]);
+
 export const LINK_SUMMARY_RESOLVE_MODE_LIST = Object.freeze([
     { label: '通用模式', value: 'general' },
     { label: '元宝模式', value: 'yuanbao' },
