@@ -605,7 +605,7 @@ export class tools extends plugin {
             const { title, cover, user_count, stream_url } = item;
             const dySendContent = `${this.identifyPrefix}识别：抖音直播，${title}`;
             // 封面
-            const dyCover = cover.url_list?.at(-1) || cover.url_list?.[0];
+            const dyCover = cover.url_list?.[0] || cover.url_list?.at(-1);
             if (this.douyinDisplayCover && dyCover) {
                 await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent, `\n🏄‍♂️在线人数：${user_count}人正在观看`]);
             } else {
@@ -640,7 +640,7 @@ export class tools extends plugin {
                 const { title, cover, user_count_str, stream_url } = item;
                 const dySendContent = `${this.identifyPrefix}识别：抖音直播，${title}`;
                 // 封面
-                const dyCover = cover.url_list?.at(-1) || cover.url_list?.[0];
+                const dyCover = cover.url_list?.[0] || cover.url_list?.at(-1);
                 if (this.douyinDisplayCover && dyCover) {
                     await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent, `\n🏄‍♂️在线人数：${user_count_str}人正在观看`]);
                 } else {
@@ -678,7 +678,7 @@ export class tools extends plugin {
                     authorNickname: item.author?.nickname || "抖音用户",
                     desc: item.desc || "",
                     durationSeconds: Math.trunc((duration || 0) / 1000),
-                    coverUrl: cover?.url_list?.at(-1) || cover?.url_list?.[0] || "",
+                    coverUrl: cover.url_list?.[0] || cover.url_list?.at(-1) || "",
                     videoUrl: resUrl,
                     downloadHeaders: null,
                     commentHeaders: headers,
