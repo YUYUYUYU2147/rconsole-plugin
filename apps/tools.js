@@ -239,7 +239,7 @@ export class tools extends plugin {
                     fnc: "bili",
                 },
                 {
-                    reg: "https?:\\/\\/x.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)",
+                    reg: "https?:\\/\\/(x|r)\\.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)(\\?.*)?",
                     fnc: "twitter_x",
                 },
                 {
