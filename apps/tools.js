@@ -2395,17 +2395,19 @@ export class tools extends plugin {
 
             if (tweet.videos?.length > 0) {
                 await e.reply(await buildPreviewMsg());
-                const video = tweet.videos.find(v => v.url) || tweet.videos[0];
-                if (!video?.url) {
+                const videosWithUrl = tweet.videos.filter(v => v.url);
+                if (videosWithUrl.length === 0) {
                     await e.reply("❌ 推文包含视频，但未解析到可下载地址");
                     return true;
                 }
-                try {
-                    const videoPath = await this.downloadVideo(video.url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4');
-                    await e.reply(segment.video(videoPath));
-                } catch (err) {
-                    logger.error(`[R插件][X] 视频下载失败: ${err.message}`);
-                    await e.reply('❌ 小蓝鸟视频下载失败，请稍后重试');
+                for (const video of videosWithUrl) {
+                    try {
+                        const videoPath = await this.downloadVideo(video.url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4');
+                        await e.reply(segment.video(videoPath));
+                    } catch (err) {
+                        logger.error(`[R插件][X] 视频下载失败: ${err.message}`);
+                        await e.reply('❌ 小蓝鸟视频下载失败，请稍后重试');
+                    }
                 }
                 return true;
             }
