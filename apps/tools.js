@@ -2393,10 +2393,16 @@ export class tools extends plugin {
                 return previewMsg;
             };
 
-            if (tweet.videos?.length > 0) {
+            const hasVideos = tweet.videos?.length > 0;
+            const hasPhotos = tweet.photos?.length > 0;
+
+            if (hasVideos || hasPhotos) {
                 await e.reply(await buildPreviewMsg());
+            }
+
+            if (hasVideos) {
                 const videosWithUrl = tweet.videos.filter(v => v.url);
-                if (videosWithUrl.length === 0) {
+                if (videosWithUrl.length === 0 && !hasPhotos) {
                     await e.reply("❌ 推文包含视频，但未解析到可下载地址");
                     return true;
                 }
@@ -2409,12 +2415,10 @@ export class tools extends plugin {
                         await e.reply('❌ 小蓝鸟视频下载失败，请稍后重试');
                     }
                 }
-                return true;
             }
 
-            if (tweet.photos?.length > 0) {
+            if (hasPhotos) {
                 const imageUrls = tweet.photos.map(p => p.url).filter(Boolean);
-                await e.reply(await buildPreviewMsg());
                 const forwardNodes = [];
                 const downloadedImagePaths = [];
 
@@ -2455,6 +2459,10 @@ export class tools extends plugin {
                         }
                     }
                 }
+                return true;
+            }
+
+            if (hasVideos || hasPhotos) {
                 return true;
             }
 
