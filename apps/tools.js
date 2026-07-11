@@ -11,6 +11,18 @@ import qrcode from "qrcode";
 import querystring from "querystring";
 import { Scraper } from '@the-convocation/twitter-scraper';
 import { cycleTLSFetch, cycleTLSExit } from '@the-convocation/twitter-scraper/cycletls';
+
+let activeTwitterCycleTlsParses = 0;
+const acquireTwitterCycleTls = () => {
+    activeTwitterCycleTlsParses += 1;
+};
+const releaseTwitterCycleTls = () => {
+    activeTwitterCycleTlsParses = Math.max(0, activeTwitterCycleTlsParses - 1);
+    if (activeTwitterCycleTlsParses === 0) {
+        cycleTLSExit();
+    }
+};
+
 import puppeteer from "../../../lib/puppeteer/puppeteer.js";
 import { replyWithRetry } from "../utils/retry.js";
 import {
@@ -2294,6 +2306,7 @@ export class tools extends plugin {
         const isOversea = await this.isOverseasServer();
 
         try {
+            acquireTwitterCycleTls();
             const scraper = new Scraper({
                 fetch: cycleTLSFetch,
             });
@@ -2365,12 +2378,13 @@ export class tools extends plugin {
                     await e.reply("❌ 推文包含视频，但未解析到可下载地址");
                     return true;
                 }
-                this.downloadVideo(video.url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4').then(videoPath => {
-                    e.reply(segment.video(videoPath));
-                }).catch(async err => {
+                try {
+                    const videoPath = await this.downloadVideo(video.url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4');
+                    await e.reply(segment.video(videoPath));
+                } catch (err) {
                     logger.error(`[R插件][X] 视频下载失败: ${err.message}`);
                     await e.reply('❌ 小蓝鸟视频下载失败，请稍后重试');
-                });
+                }
                 return true;
             }
 
@@ -2378,6 +2392,7 @@ export class tools extends plugin {
                 const imageUrls = tweet.photos.map(p => p.url).filter(Boolean);
                 await e.reply(await buildPreviewMsg());
                 const forwardNodes = [];
+                const downloadedImagePaths = [];
 
                 for (const url of imageUrls) {
                     let imageSeg;
@@ -2395,6 +2410,7 @@ export class tools extends plugin {
                             },
                             downloadMethod: this.biliDownloadMethod,
                         });
+                        downloadedImagePaths.push(xImgPath);
                         imageSeg = segment.image(xImgPath);
                     }
                     forwardNodes.push({
@@ -2405,6 +2421,9 @@ export class tools extends plugin {
                 }
 
                 await e.reply(await Bot.makeForwardMsg(forwardNodes));
+                for (const filePath of downloadedImagePaths) {
+                    await checkAndRemoveFile(filePath);
+                }
                 return true;
             }
 
@@ -2425,9 +2444,7 @@ export class tools extends plugin {
             await e.reply(userHint);
             return true;
         } finally {
-            try {
-                cycleTLSExit();
-            } catch {}
+            releaseTwitterCycleTls();
         }
     }
 
