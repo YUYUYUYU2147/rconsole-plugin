@@ -2394,35 +2394,42 @@ export class tools extends plugin {
                 const forwardNodes = [];
                 const downloadedImagePaths = [];
 
-                for (const url of imageUrls) {
-                    let imageSeg;
-                    if (isOversea) {
-                        imageSeg = segment.image(url);
-                    } else {
-                        const localPath = this.getCurDownloadPath(e);
-                        const xImgPath = await downloadImg({
-                            img: url,
-                            dir: localPath,
-                            isProxy: !isOversea,
-                            proxyInfo: {
-                                proxyAddr: this.proxyAddr,
-                                proxyPort: this.proxyPort
-                            },
-                            downloadMethod: this.biliDownloadMethod,
+                try {
+                    for (const url of imageUrls) {
+                        let imageSeg;
+                        if (isOversea) {
+                            imageSeg = segment.image(url);
+                        } else {
+                            const localPath = this.getCurDownloadPath(e);
+                            const xImgPath = await downloadImg({
+                                img: url,
+                                dir: localPath,
+                                isProxy: !isOversea,
+                                proxyInfo: {
+                                    proxyAddr: this.proxyAddr,
+                                    proxyPort: this.proxyPort
+                                },
+                                downloadMethod: this.biliDownloadMethod,
+                            });
+                            downloadedImagePaths.push(xImgPath);
+                            imageSeg = segment.image(xImgPath);
+                        }
+                        forwardNodes.push({
+                            message: imageSeg,
+                            nickname: e.sender.card || e.sender.nickname || String(e.user_id),
+                            user_id: e.user_id,
                         });
-                        downloadedImagePaths.push(xImgPath);
-                        imageSeg = segment.image(xImgPath);
                     }
-                    forwardNodes.push({
-                        message: imageSeg,
-                        nickname: e.sender.card || e.sender.nickname || String(e.user_id),
-                        user_id: e.user_id,
-                    });
-                }
 
-                await e.reply(await Bot.makeForwardMsg(forwardNodes));
-                for (const filePath of downloadedImagePaths) {
-                    await checkAndRemoveFile(filePath);
+                    await e.reply(await Bot.makeForwardMsg(forwardNodes));
+                } finally {
+                    for (const filePath of downloadedImagePaths) {
+                        try {
+                            await checkAndRemoveFile(filePath);
+                        } catch (cleanupErr) {
+                            logger.warn(`[R插件][X] 清理临时图片失败: ${cleanupErr.message}`);
+                        }
+                    }
                 }
                 return true;
             }
