@@ -239,7 +239,7 @@ export class tools extends plugin {
                     fnc: "bili",
                 },
                 {
-                    reg: "https?:\\/\\/(x|r)\\.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)(\\?.*)?",
+                    reg: "https?:\\/\\/(x|r|twitter)\\.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)(\\?.*)?",
                     fnc: "twitter_x",
                 },
                 {
@@ -2309,14 +2309,15 @@ export class tools extends plugin {
             return;
         }
 
-        const reg = /https:\/\/(x|r)\.com\/([\w]+)\/status\/(\d+)(\/photo\/\d+)?(\?[^\s]*)?/;
+        const reg = /https?:\/\/(x|r|twitter)\.com\/([\w]+)\/status\/(\d+)(\/photo\/\d+)?(\?[^\s]*)?/;
         const match = reg.exec(e.msg);
         if (!match) {
             await e.reply("❌ 无法识别 X 链接");
             return true;
         }
 
-        const twitterUrl = match[0].replace('https://r.com/', 'https://x.com/');
+        const rawUrl = match[0].replace(/^http:\/\//, 'https://');
+        const twitterUrl = rawUrl.replace(/https:\/\/(r|twitter)\.com\//, 'https://x.com/');
         const tweetId = match[3];
         const isOversea = await this.isOverseasServer();
 
