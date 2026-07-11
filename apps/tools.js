@@ -13,14 +13,29 @@ import { Scraper } from '@the-convocation/twitter-scraper';
 import { cycleTLSFetch, cycleTLSExit } from '@the-convocation/twitter-scraper/cycletls';
 
 let activeTwitterCycleTlsParses = 0;
-const acquireTwitterCycleTls = () => {
+let twitterCycleTlsExitPromise = null;
+const acquireTwitterCycleTls = async () => {
+    if (twitterCycleTlsExitPromise) {
+        await twitterCycleTlsExitPromise;
+    }
     activeTwitterCycleTlsParses += 1;
 };
-const releaseTwitterCycleTls = () => {
+const releaseTwitterCycleTls = async () => {
     activeTwitterCycleTlsParses = Math.max(0, activeTwitterCycleTlsParses - 1);
-    if (activeTwitterCycleTlsParses === 0) {
-        cycleTLSExit();
+    if (activeTwitterCycleTlsParses !== 0) {
+        return;
     }
+    if (!twitterCycleTlsExitPromise) {
+        twitterCycleTlsExitPromise = Promise.resolve()
+            .then(() => cycleTLSExit())
+            .catch(err => {
+                logger.warn(`[R插件][X] CycleTLS 退出失败: ${err.message}`);
+            })
+            .finally(() => {
+                twitterCycleTlsExitPromise = null;
+            });
+    }
+    await twitterCycleTlsExitPromise;
 };
 
 import puppeteer from "../../../lib/puppeteer/puppeteer.js";
@@ -2306,9 +2321,16 @@ export class tools extends plugin {
         const isOversea = await this.isOverseasServer();
 
         try {
-            acquireTwitterCycleTls();
+            await acquireTwitterCycleTls();
+            const twitterFetch = (input, init = {}) => {
+                const requestInit = { ...init };
+                if (!isOversea && this.myProxy) {
+                    requestInit.proxy = this.myProxy;
+                }
+                return cycleTLSFetch(input, requestInit);
+            };
             const scraper = new Scraper({
-                fetch: cycleTLSFetch,
+                fetch: twitterFetch,
             });
 
             if (!_.isEmpty(this.xCookie)) {
@@ -2451,7 +2473,7 @@ export class tools extends plugin {
             await e.reply(userHint);
             return true;
         } finally {
-            releaseTwitterCycleTls();
+            await releaseTwitterCycleTls();
         }
     }
 
