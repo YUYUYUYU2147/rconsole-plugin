@@ -6,15 +6,17 @@ import PickSongList from "../model/pick-song.js";
 import NeteaseMusicInfo from '../model/neteaseMusicInfo.js'
 import { NETEASE_API_CN, NETEASE_SONG_DOWNLOAD, NETEASE_TEMP_API } from "../constants/tools.js";
 import { COMMON_USER_AGENT, REDIS_YUNZAI_ISOVERSEA, REDIS_YUNZAI_SONGINFO, REDIS_YUNZAI_CLOUDSONGLIST } from "../constants/constant.js";
-import { downloadAudio, retryAxiosReq } from "../utils/common.js";
+import { cleanFilename, downloadAudio, retryAxiosReq } from "../utils/common.js";
 import { redisExistKey, redisGetKey, redisSetKey } from "../utils/redis-util.js";
 import { checkAndRemoveFile, checkFileExists, splitPaths } from "../utils/file.js";
 import { sendMusicCard, sendCustomMusicCard, getGroupFileUrl, getReplyMsg } from "../utils/yunzai-util.js";
+import { getKugouSongUrl, searchKugouSongList } from "../utils/kugou.js";
 import config from "../model/config.js";
 import FormData from 'form-data';
 import NodeID3 from 'node-id3';
 
 let FileSuffix = 'flac'
+const REDIS_YUNZAI_KUGOU_SONGINFO = "Yunzai:R-Plugin:kugouSongInfo";
 
 export class songRequest extends plugin {
     constructor() {
@@ -30,6 +32,14 @@ export class songRequest extends plugin {
                 {
                     reg: "^#播放\\s*(.+?)(?:\\s+([12]))?$",
                     fnc: "playSong"
+                },
+                {
+                    reg: "^#?(?:酷狗|kg|KG)点歌\\s*(.+)$|^#?(?:酷狗|kg|KG)听[1-9][0-9]*$",
+                    fnc: "pickKugouSong"
+                },
+                {
+                    reg: "^#?(?:酷狗|kg|KG)播放\\s*(.+)$",
+                    fnc: "playKugouSong"
                 },
                 {
                     reg: "^#?上传$",
@@ -80,6 +90,9 @@ export class songRequest extends plugin {
         // uid
         this.uid = this.toolsConfig.neteaseUserId
         this.cloudUid = this.toolsConfig.neteaseCloudUserId
+        this.kugouApiServer = this.toolsConfig.kugouApiServer
+        this.kugouAudioQuality = this.toolsConfig.kugouAudioQuality || 'viper_clear'
+        this.kugouCookie = this.toolsConfig.kugouCookie
     }
 
     async pickSong(e) {
@@ -294,6 +307,172 @@ export class songRequest extends plugin {
                 }
             })
         }
+    }
+
+    formatKugouDuration(duration) {
+        const value = Number(duration);
+        if (!Number.isFinite(value) || value <= 0) {
+            return "";
+        }
+        const seconds = value > 10000 ? Math.floor(value / 1000) : Math.floor(value);
+        const minute = String(Math.floor(seconds / 60)).padStart(2, "0");
+        const second = String(seconds % 60).padStart(2, "0");
+        return `${minute}:${second}`;
+    }
+
+    buildKugouPickItem(item = {}) {
+        const singerName = item.authorName || "未知歌手";
+        let songName = item.songName || item.audioName || "未知歌曲";
+        const singerPrefixReg = new RegExp(`^${String(singerName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[-–—_]\\s*`);
+        songName = songName.replace(singerPrefixReg, "").trim() || songName;
+        return {
+            id: item.hash,
+            hash: item.hash,
+            albumId: item.albumId || "",
+            albumAudioId: item.albumAudioId || "",
+            songName,
+            singerName,
+            duration: this.formatKugouDuration(item.duration),
+            cover: item.cover || "def",
+            type: "kugou",
+            cookie: item.cookie || this.kugouCookie || "",
+        };
+    }
+
+    async searchKugouPickList(keyword) {
+        if (!this.kugouApiServer) {
+            throw new Error("未配置酷狗开源API地址，请先填写 tools.kugouApiServer");
+        }
+        const list = await searchKugouSongList(
+            this.kugouApiServer,
+            keyword,
+            this.kugouCookie,
+            this.songRequestMaxList
+        );
+        return list.map(item => this.buildKugouPickItem(item));
+    }
+
+    async pickKugouSong(e) {
+        if (!this.useNeteaseSongRequest) {
+            logger.info('当前未开启点歌功能')
+            return false
+        }
+        if (!e.group_id) return
+
+        const listenMatch = e.msg.replace(/\s+/g, "").match(/^#?(?:酷狗|kg|KG)听(\d+)$/);
+        if (listenMatch) {
+            const pickNumber = Number(listenMatch[1]) - 1;
+            const songInfo = await redisGetKey(REDIS_YUNZAI_KUGOU_SONGINFO) || [];
+            const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
+            const selectedSong = songInfo?.[saveId]?.data?.[pickNumber];
+            if (!selectedSong) {
+                e.reply("没有找到这首酷狗歌曲，请先发送 #酷狗点歌 歌名");
+                return true;
+            }
+            await this.kugouPlay(e, selectedSong);
+            return true;
+        }
+
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)点歌\s*(.+)$/);
+        const keyword = match?.[1]?.trim();
+        if (!keyword) return false;
+
+        try {
+            const data = await this.searchKugouPickList(keyword);
+            if (!data.length) {
+                e.reply("暂未在酷狗找到你想听的歌哦~");
+                return true;
+            }
+
+            const songInfo = await redisGetKey(REDIS_YUNZAI_KUGOU_SONGINFO) || [];
+            const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
+            const musicDate = { group_id: e.group_id, data };
+            if (saveId === -1) {
+                songInfo.push(musicDate);
+            } else {
+                songInfo[saveId] = musicDate;
+            }
+            await redisSetKey(REDIS_YUNZAI_KUGOU_SONGINFO, songInfo);
+
+            const renderData = await new PickSongList(e).getData(data);
+            const img = await puppeteer.screenshot("pick-song", renderData);
+            await e.reply(img);
+        } catch (error) {
+            logger.error("[R插件][酷狗点歌] 搜索失败", error);
+            e.reply(`酷狗点歌搜索失败：${error.message || error}`);
+        }
+        return true;
+    }
+
+    async playKugouSong(e) {
+        if (!this.useNeteaseSongRequest) {
+            logger.info('当前未开启点歌功能')
+            return false
+        }
+        if (!e.group_id) return
+
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\s*(.+)$/);
+        const keyword = match?.[1]?.trim();
+        if (!keyword) return false;
+
+        try {
+            const data = await this.searchKugouPickList(keyword);
+            if (!data.length) {
+                e.reply("暂未在酷狗找到你想听的歌哦~");
+                return true;
+            }
+            await this.kugouPlay(e, data[0]);
+        } catch (error) {
+            logger.error("[R插件][酷狗播放] 失败", error);
+            e.reply(`酷狗播放失败：${error.message || error}`);
+        }
+        return true;
+    }
+
+    async kugouPlay(e, song) {
+        if (!this.kugouApiServer) {
+            e.reply("未配置酷狗开源API地址，请先填写 tools.kugouApiServer");
+            return true;
+        }
+        const urlResult = await getKugouSongUrl(this.kugouApiServer, {
+            hash: song.hash || song.id,
+            albumId: song.albumId || "",
+            albumAudioId: song.albumAudioId || "",
+            cookie: song.cookie || this.kugouCookie,
+            quality: this.kugouAudioQuality,
+        });
+        if (!urlResult.url) {
+            e.reply(`未从酷狗 API 获取到可用音源：${urlResult.error || "请检查酷狗 Cookie 或歌曲权限"}`);
+            return true;
+        }
+
+        const cardData = await new NeteaseMusicInfo(e).getData({
+            cover: urlResult.cover || song.cover,
+            songName: song.songName,
+            singerName: song.singerName,
+            size: urlResult.size || urlResult.qualityLabel,
+            musicType: ["酷狗音乐", urlResult.qualityLabel].filter(Boolean)
+        });
+        const img = await puppeteer.screenshot("neteaseMusicInfo", cardData);
+        await e.reply(img);
+
+        const fileName = cleanFilename(`${song.singerName}-${song.songName}`) || `kugou_${String(song.hash || song.id).slice(0, 8)}`;
+        await downloadAudio(urlResult.url, this.getCurDownloadPath(e), fileName, 'follow', urlResult.audioType)
+            .then(async path => {
+                try {
+                    if (urlResult.audioType !== 'mp4' && this.isSendVocal) {
+                        await e.reply(segment.record(path));
+                    }
+                    await this.uploadGroupFile(e, path);
+                } finally {
+                    await checkAndRemoveFile(path);
+                }
+            })
+            .catch(err => {
+                logger.error(`下载酷狗音乐失败，错误信息为: ${err.message || err}`);
+                e.reply(`下载酷狗音乐失败：${err.message || err}`);
+            });
+        return true;
     }
 
 

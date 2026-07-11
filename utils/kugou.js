@@ -527,6 +527,49 @@ export async function searchKugouSong(apiServer, keyword, kugouCookie = "") {
     };
 }
 
+export async function searchKugouSongList(apiServer, keyword, kugouCookie = "", limit = 10) {
+    const params = {
+        keywords: keyword,
+        type: "song",
+        page: 1,
+        pagesize: Math.max(1, Math.min(Number(limit) || 10, 30)),
+        ...(kugouCookie ? { cookie: kugouCookie } : {}),
+    };
+    const response = await requestKugouApi(apiServer, "/search", params, kugouCookie);
+    const listItems = Array.isArray(response.data?.data?.lists)
+        ? response.data.data.lists
+        : collectObjects(response.data, []).filter(item =>
+            item &&
+            (item.hash || item.Hash || item.FileHash || item.fileHash) &&
+            (
+                item.filename ||
+                item.songname ||
+                item.song_name ||
+                item.audio_name ||
+                item.name ||
+                item.FileName ||
+                item.OriSongName
+            )
+        );
+
+    const seenHashes = new Set();
+    return listItems
+        .map(item => ({
+            ...normalizeKugouSongCandidate(item),
+            cookie: response.cookie,
+            duration: item.duration || item.Duration || item.timelen || item.time_length || item.duration_ms || "",
+        }))
+        .filter(item => {
+            const hashKey = normalizeHashKey(item.hash);
+            if (!hashKey || seenHashes.has(hashKey)) {
+                return false;
+            }
+            seenHashes.add(hashKey);
+            return true;
+        })
+        .slice(0, Math.max(1, Math.min(Number(limit) || 10, 30)));
+}
+
 export async function getKugouSongUrl(apiServer, { hash, albumId = "", albumAudioId = "", cookie = "", freePart = 0, quality = "" }) {
     const registerResp = await registerKugouDevice(apiServer);
     const requestCookie = mergeCookies(cookie, registerResp.cookie);
