@@ -2309,15 +2309,15 @@ export class tools extends plugin {
             return;
         }
 
-        const reg = /https:\/\/x\.com\/([\w]+)\/status\/(\d+)(\/photo\/\d+)?/;
+        const reg = /https:\/\/(x|r)\.com\/([\w]+)\/status\/(\d+)(\/photo\/\d+)?(\?[^\s]*)?/;
         const match = reg.exec(e.msg);
         if (!match) {
             await e.reply("❌ 无法识别 X 链接");
             return true;
         }
 
-        const twitterUrl = match[0];
-        const tweetId = match[2];
+        const twitterUrl = match[0].replace('https://r.com/', 'https://x.com/');
+        const tweetId = match[3];
         const isOversea = await this.isOverseasServer();
 
         try {
