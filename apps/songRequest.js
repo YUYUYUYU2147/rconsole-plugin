@@ -976,18 +976,16 @@ export class songRequest extends plugin {
             // 下载音乐
             downloadAudio(url, this.getCurDownloadPath(e), title, 'follow', musicExt)
                 .then(async path => {
-                    if (!cardSentSuccessfully) {
-                        try {
-                            // 发送群文件
-                            await this.uploadGroupFile(e, path);
-                            // 发送语音
-                            if (musicExt != 'mp4' && this.isSendVocal) {
-                                await e.reply(segment.record(path));
-                            }
-                        } finally {
-                            // 删除文件
-                            await checkAndRemoveFile(path);
+                    try {
+                        // 点歌成功后固定发送群文件；卡片失败时也继续作为兜底
+                        await this.uploadGroupFile(e, path);
+                        // 发送语音
+                        if (musicExt != 'mp4' && this.isSendVocal) {
+                            await e.reply(segment.record(path));
                         }
+                    } finally {
+                        // 删除文件
+                        await checkAndRemoveFile(path);
                     }
                 })
                 .catch(err => {
