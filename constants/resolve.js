@@ -5,6 +5,7 @@ export const RESOLVE_CONTROLLER_NAME_ENUM = {
     "bili": "哔哩哔哩",
     "tiktok": "TikTok",
     "twitter_x": "Twitter",
+    "instagram": "Instagram",
     "acfun": "Acfun",
     "xhs": "小红书",
     "bodianMusic": "波点",

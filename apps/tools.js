@@ -164,6 +164,7 @@ import { convertToSeconds, removeParams, ytbFormatTime } from "../utils/youtube.
 import { ytDlpGetDuration, ytDlpGetThumbnail, ytDlpGetThumbnailUrl, ytDlpGetTilt, ytDlpHelper } from "../utils/yt-dlp-util.js";
 import { textArrayToMakeForward, downloadImagesAndMakeForward, cleanupTempFiles, sendImagesInBatches, sendCustomMusicCard } from "../utils/yunzai-util.js";
 import { getApiParams, optimizeImageUrl } from "../utils/xiaoheihe.js";
+import { extractInstagramUrl, fetchInstagramMedia, normalizeInstagramMedia } from "../utils/instagram.js";
 
 /**
  * fetch重试函数
@@ -241,6 +242,10 @@ export class tools extends plugin {
                 {
                     reg: "https?:\\/\\/(x|r|twitter)\\.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)(\\?.*)?",
                     fnc: "twitter_x",
+                },
+                {
+                    reg: "https?:\\/\\/(www\\.)?instagram\\.com\\/(p|reel|reels)\\/",
+                    fnc: "instagram",
                 },
                 {
                     reg: "(acfun.cn|^ac[0-9]{8}$)",
@@ -2485,6 +2490,119 @@ export class tools extends plugin {
             return true;
         } finally {
             await releaseTwitterCycleTls();
+        }
+    }
+
+    // Instagram 解析（第三方临时接口，随时可能下架）
+    async instagram(e) {
+        // 切面判断是否需要解析
+        if (!(await this.isEnableResolve(RESOLVE_CONTROLLER_NAME_ENUM.instagram))) {
+            logger.info(`[R插件][全局解析控制] ${RESOLVE_CONTROLLER_NAME_ENUM.instagram} 已拦截`);
+            return false;
+        }
+        if (!(await this.isTrustUser(e.user_id))) {
+            e.reply("你没有权限使用此命令");
+            return;
+        }
+        // Instagram 在国内无法直连，统一按海外/代理处理
+        const isOversea = await this.isOverseasServer();
+        if (!isOversea && !(await testProxy(this.proxyAddr, this.proxyPort))) {
+            e.reply("检测到没有梯子，无法解析 Instagram");
+            return false;
+        }
+
+        const igUrl = extractInstagramUrl(e.msg);
+        if (!igUrl) {
+            await e.reply("❌ 无法识别 Instagram 链接");
+            return true;
+        }
+
+        try {
+            const raw = await fetchInstagramMedia(igUrl);
+            const media = normalizeInstagramMedia(raw);
+            if (!media) {
+                logger.error(`[R插件][Instagram] 解析失败，原始返回: ${JSON.stringify(raw).slice(0, 500)}`);
+                await e.reply("❌ Instagram 解析失败，第三方临时接口可能已下架或失效，请稍后重试");
+                return true;
+            }
+
+            // 预览文案（只发一次）
+            let previewMsg = `${this.identifyPrefix}识别：Instagram`;
+            if (media.title) {
+                previewMsg += `，${media.title}`;
+                try {
+                    const translatedText = await this.translateEngine.translate(media.title, '中');
+                    if (_.trim(translatedText) && _.trim(translatedText) !== '翻译失败') {
+                        previewMsg += `\n——————\n翻译：${_.trim(translatedText)}`;
+                    }
+                } catch (err) {
+                    logger.warn(`[R插件][Instagram] 文案翻译失败: ${err.message}`);
+                }
+            }
+            await e.reply(previewMsg);
+
+            // 视频类型
+            if (media.noteType === "video" && media.videoUrl) {
+                try {
+                    const videoPath = await this.downloadVideo(media.videoUrl, !isOversea, null, this.videoDownloadConcurrency, 'instagram.mp4');
+                    await e.reply(segment.video(videoPath));
+                } catch (err) {
+                    logger.error(`[R插件][Instagram] 视频下载失败: ${err.message}`);
+                    await e.reply('❌ Instagram 视频下载失败，请稍后重试');
+                }
+                return true;
+            }
+
+            // 图文类型
+            if (media.noteType === "image" && media.images.length > 0) {
+                const downloadPath = this.getCurDownloadPath(e);
+                const downloadedImagePaths = [];
+                const forwardNodes = [];
+                try {
+                    for (const url of media.images) {
+                        let imageSeg;
+                        if (isOversea) {
+                            imageSeg = segment.image(url);
+                        } else {
+                            const imgPath = await downloadImg({
+                                img: url,
+                                dir: downloadPath,
+                                isProxy: !isOversea,
+                                proxyInfo: {
+                                    proxyAddr: this.proxyAddr,
+                                    proxyPort: this.proxyPort,
+                                },
+                                downloadMethod: this.biliDownloadMethod,
+                            });
+                            downloadedImagePaths.push(imgPath);
+                            imageSeg = segment.image(imgPath);
+                        }
+                        forwardNodes.push({
+                            message: imageSeg,
+                            nickname: e.sender.card || e.sender.nickname || String(e.user_id),
+                            user_id: e.user_id,
+                        });
+                    }
+                    await e.reply(await Bot.makeForwardMsg(forwardNodes));
+                } finally {
+                    for (const filePath of downloadedImagePaths) {
+                        try {
+                            await checkAndRemoveFile(filePath);
+                        } catch (cleanupErr) {
+                            logger.warn(`[R插件][Instagram] 清理临时图片失败: ${cleanupErr.message}`);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            // 既无视频也无图片：预览文案已发送，无额外媒体可下发
+            await e.reply("❌ 未解析到图片或视频，第三方临时接口可能已下架或失效");
+            return true;
+        } catch (err) {
+            logger.error(`[R插件][Instagram] 解析失败: ${err.message}`);
+            await e.reply("❌ Instagram 解析失败，第三方临时接口可能已下架或失效，请稍后重试");
+            return true;
         }
     }
 

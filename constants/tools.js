@@ -205,6 +205,15 @@ export const TWITTER_TWEET_INFO = "https://api.twitter.com/2/tweets?ids={}";
 export const XHS_REQ_LINK = "https://www.xiaohongshu.com/explore/";
 
 /**
+ * Instagram 解析接口（第三方临时接口）
+ * ⚠️ 该接口为第三方临时解析服务，非官方接口，随时可能下架或失效，届时需要更换或自建。
+ * 用法：在 url 参数中传入 instagram.com 的分享链接（图文 /p/、视频 /reel/ 均可）。
+ * 返回 data.noteType: "image" 走图片数组，"video" 走视频直链。
+ * @type {string}
+ */
+export const IG_TEMP_PARSE_API = "https://downloader-api.bhwa233.com/api/parse?url={}";
+
+/**
  * 通用解析的请求链接1（主用）
  * 更新时间：2025-12-15
  * 支持平台：快手、西瓜视频、皮皮搞笑、QQ小世界、抖音动图、皮皮虾、即刻、贴吧等
