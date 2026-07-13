@@ -65,8 +65,23 @@ export function normalizeInstagramMedia(raw) {
     // 封面统一做 https 归一化
     const cover = normalizeUrl(data.cover);
 
-    // 视频类型：优先取无水印直链，其次回退 downloadVideoUrl
-    if (data.noteType === "video" || data.type === "video") {
+    // 图文类型：收集 images 数组里的地址
+    const images = Array.isArray(data.images)
+        ? data.images
+            .map(item => normalizeUrl(item?.url || item?.downloadUrl))
+            .filter(Boolean)
+        : [];
+
+    // ⚠️ 这里只能依赖 noteType 区分图文/视频：
+    // 第三方接口的 data.type 字段不可靠——图文帖也会返回 type:"video"，
+    // data.downloadUrl 同样会带 type=video 参数（实为 API 包装地址，非媒体直链），
+    // 一旦误判会把图文当成视频下载，发出错误的「视频」消息。
+    // 真正可靠的只有 noteType：image=图文，video=视频。
+    const isVideo = data.noteType === "video" && hasRealVideoUrl(data);
+
+    if (isVideo) {
+        // 视频直链优先取 CDN 原始地址（originDownloadVideoUrl），
+        // downloadVideoUrl/videoDownloadUrl/downloadUrl 都是 API 包装地址，仅作兜底。
         const videoUrl = normalizeUrl(
             data.originDownloadVideoUrl
             || data.downloadVideoUrl
@@ -82,12 +97,10 @@ export function normalizeInstagramMedia(raw) {
         };
     }
 
-    // 图文类型：收集 images 数组里的地址
-    const images = Array.isArray(data.images)
-        ? data.images
-            .map(item => normalizeUrl(item?.url || item?.downloadUrl))
-            .filter(Boolean)
-        : [];
+    // 既没有视频直链，也没有图片，说明接口结构异常
+    if (images.length === 0) {
+        return null;
+    }
 
     return {
         noteType: "image",
@@ -96,6 +109,18 @@ export function normalizeInstagramMedia(raw) {
         videoUrl: "",
         images,
     };
+}
+
+/**
+ * 判断是否存在真正的视频媒体直链
+ * 仅当 noteType=video 且存在 CDN 直链（originDownloadVideoUrl）时视为视频，
+ * 避免图文帖因 type=video / downloadUrl(type=video) 被误判。
+ * @param {object} data
+ * @returns {boolean}
+ */
+function hasRealVideoUrl(data) {
+    return Boolean(data.originDownloadVideoUrl)
+        || Boolean(data.videoDownloadUrl && data.videoDownloadUrl !== data.downloadUrl);
 }
 
 /**
