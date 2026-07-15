@@ -73,6 +73,8 @@ const YUANBAO_CHAT_PAGE = `https://yuanbao.tencent.com/chat/${AGENT_ID}`;
  *   Cookie 变化时自动重建
  */
 let uskeySession = null;
+// 串行化 uskey 会话创建 + page.evaluate，避免并发总结互相关掉对方页面
+let uskeyGenerationQueue = Promise.resolve();
 
 function buildSummaryPrompt(input, { isContent = false } = {}) {
     const sourceLabel = isContent ? '网页内容' : '链接';
@@ -192,11 +194,10 @@ async function getPlaywrightBrowser() {
 }
 
 /**
- * 关闭 uskey 会话（仅关闭我们创建的 context/page；独立 browser 也一并关闭）
+ * 关闭指定 uskey 会话资源（可传会话对象，避免并发时误清全局指针）
+ * @param {object|null} [session]
  */
-async function closeUskeySession() {
-    const session = uskeySession;
-    uskeySession = null;
+async function disposeUskeySession(session) {
     if (!session) return;
     try {
         await session.page?.close().catch(() => {});
@@ -213,7 +214,17 @@ async function closeUskeySession() {
 }
 
 /**
+ * 关闭当前全局 uskey 会话
+ */
+async function closeUskeySession() {
+    const session = uskeySession;
+    uskeySession = null;
+    await disposeUskeySession(session);
+}
+
+/**
  * 确保存在可用的元宝页面，用于调用前端 Qimei SDK 生成 x-uskey
+ * 注意：调用方需保证串行（见 generateSecurityHeaders 队列），本函数本身不处理并发互斥
  * @param {string} cookie
  * @returns {Promise<{ page: import('playwright').Page }>}
  */
@@ -237,74 +248,74 @@ async function ensureUskeySession(cookie) {
         throw new Error('获取到的浏览器对象不是原生 Playwright Browser（缺少 newContext）');
     }
 
-    // 独立 context，避免污染宿主默认 context 的 Cookie/UA
-    const context = await browser.newContext({
-        userAgent: COMMON_HEADERS['user-agent'],
-        viewport: { width: 1280, height: 800 },
-        locale: 'zh-CN',
-    });
-    const ownedContext = true;
-    await context.addCookies(parseCookieString(cookie));
-    const page = await context.newPage();
+    let context;
+    let page;
+    try {
+        // 独立 context，避免污染宿主默认 context 的 Cookie/UA
+        context = await browser.newContext({
+            userAgent: COMMON_HEADERS['user-agent'],
+            viewport: { width: 1280, height: 800 },
+            locale: 'zh-CN',
+        });
+        await context.addCookies(parseCookieString(cookie));
+        page = await context.newPage();
 
-    // 打开元宝对话页，等待 webpack + Qimei SDK 就绪
-    await page.goto(YUANBAO_CHAT_PAGE, {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-    });
+        // 打开元宝对话页，等待 webpack + Qimei SDK 就绪
+        await page.goto(YUANBAO_CHAT_PAGE, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+        });
 
-    // 轮询等待 getUSKeySync 可用（通常 1-3 秒）
-    const ready = await page.waitForFunction(() => {
-        try {
-            let webpackRequire = null;
-            if (!self.webpackChunk_N_E) return false;
-            self.webpackChunk_N_E.push([[`__yb_uskey_ready_${Date.now()}__`], {}, (req) => {
-                webpackRequire = req;
-            }]);
-            if (!webpackRequire) return false;
-            const mod = webpackRequire(12601);
-            const inst = mod?.I5?.('0WEB05U9OEC1ZNRY');
-            const h38 = inst?.getLocalQimei36?.()?.h38 || localStorage.getItem('_qimei_h38') || '';
-            return !!(inst?.getUSKeySync && h38 && String(h38).length === 38);
-        } catch (_) {
-            return false;
+        // 轮询等待 getUSKeySync 可用（通常 1-3 秒）
+        const ready = await page.waitForFunction(() => {
+            try {
+                let webpackRequire = null;
+                if (!self.webpackChunk_N_E) return false;
+                self.webpackChunk_N_E.push([[`__yb_uskey_ready_${Date.now()}__`], {}, (req) => {
+                    webpackRequire = req;
+                }]);
+                if (!webpackRequire) return false;
+                const mod = webpackRequire(12601);
+                const inst = mod?.I5?.('0WEB05U9OEC1ZNRY');
+                const h38 = inst?.getLocalQimei36?.()?.h38 || localStorage.getItem('_qimei_h38') || '';
+                return !!(inst?.getUSKeySync && h38 && String(h38).length === 38);
+            } catch (_) {
+                return false;
+            }
+        }, { timeout: 30000 }).then(() => true).catch(() => false);
+
+        if (!ready) {
+            throw new Error('元宝页面 Qimei SDK 初始化超时，无法生成 x-uskey（可检查 Cookie 是否失效或网络是否可达 yuanbao.tencent.com）');
         }
-    }, { timeout: 30000 }).then(() => true).catch(() => false);
 
-    if (!ready) {
-        await context.close().catch(() => {});
-        if (owned) await browser.close().catch(() => {});
-        throw new Error('元宝页面 Qimei SDK 初始化超时，无法生成 x-uskey（可检查 Cookie 是否失效或网络是否可达 yuanbao.tencent.com）');
+        uskeySession = {
+            browser,
+            owned,
+            context,
+            ownedContext: true,
+            page,
+            cookie,
+        };
+        logger.info('[R插件][链接总结][元宝] x-uskey 生成会话已就绪');
+        return uskeySession;
+    } catch (err) {
+        // 初始化任一步失败都回收已创建资源，避免 context/browser 泄漏
+        await page?.close().catch(() => {});
+        await context?.close().catch(() => {});
+        // 仅关闭我们独立 launch 的 browser；宿主 browser 绝不能关
+        if (owned) {
+            await browser.close().catch(() => {});
+        }
+        throw err;
     }
-
-    uskeySession = { browser, owned, context, ownedContext, page, cookie };
-    // 独立 browser 在进程退出时尽量回收，避免 bot 热重载后残留 chromium
-    if (owned && !globalThis.__rpluginYuanbaoUskeyExitHooked) {
-        const cleanup = () => { closeUskeySession(); };
-        process.once('exit', cleanup);
-        process.once('SIGINT', cleanup);
-        process.once('SIGTERM', cleanup);
-        globalThis.__rpluginYuanbaoUskeyExitHooked = true;
-    }
-    logger.info('[R插件][链接总结][元宝] x-uskey 生成会话已就绪');
-    return uskeySession;
 }
 
 /**
- * 生成元宝业务签名头：
- *   x-uskey / x-bus-params-md5 / x-timestamp
- *
- * 前端逻辑（_app.js 抓包还原）：
- *   h38 = qimei.getLocalQimei36().h38
- *   params = `h38=${h38}&timestamp=${Date.now()}&platform=web`
- *   x-uskey = encodeURIComponent(qimei.getUSKeySync("7800385", h38, params))
- *   x-bus-params-md5 = md5(params)
- *   x-timestamp = timestamp
- *
+ * 实际生成元宝业务签名头（需在串行队列中调用）
  * @param {string} cookie
  * @returns {Promise<object>}
  */
-async function generateSecurityHeaders(cookie) {
+async function generateSecurityHeadersUnsafe(cookie) {
     const session = await ensureUskeySession(cookie);
     const deviceId = getCookieValue(cookie, '_qimei_uuid42');
 
@@ -345,6 +356,33 @@ async function generateSecurityHeaders(cookie) {
 }
 
 /**
+ * 生成元宝业务签名头：
+ *   x-uskey / x-bus-params-md5 / x-timestamp
+ *
+ * 前端逻辑（_app.js 抓包还原）：
+ *   h38 = qimei.getLocalQimei36().h38
+ *   params = `h38=${h38}&timestamp=${Date.now()}&platform=web`
+ *   x-uskey = encodeURIComponent(qimei.getUSKeySync("7800385", h38, params))
+ *   x-bus-params-md5 = md5(params)
+ *   x-timestamp = timestamp
+ *
+ * 并发保护：
+ *   多个总结请求可能同时进入；uskeySession 是全局共享页面，
+ *   必须串行化“确保会话 + evaluate”，否则会互相 close 对方 page。
+ *
+ * @param {string} cookie
+ * @returns {Promise<object>}
+ */
+async function generateSecurityHeaders(cookie) {
+    const run = uskeyGenerationQueue.then(
+        () => generateSecurityHeadersUnsafe(cookie),
+    );
+    // 前一个失败也不阻塞后续任务
+    uskeyGenerationQueue = run.catch(() => undefined);
+    return run;
+}
+
+/**
  * 构建带 Cookie + referer 的完整请求头
  * @param {string} cookie 腾讯元宝 Web 端 Cookie
  * @param {string} chatId 会话 ID（用于 referer 与 x-agentid）
@@ -356,11 +394,12 @@ async function generateSecurityHeaders(cookie) {
  * @returns {object}
  */
 function buildHeaders(cookie, chatId, extra = {}, { chatIdInPath = true } = {}) {
-    const path = chatIdInPath ? `${AGENT_ID}/${chatId}` : AGENT_ID;
+    // chatId 为空时强制只使用 agentId，避免生成 naQivTmsDa/ 这种尾斜杠路径
+    const path = (chatIdInPath && chatId) ? `${AGENT_ID}/${chatId}` : AGENT_ID;
     return {
         ...COMMON_HEADERS,
         'referer': `https://yuanbao.tencent.com/chat/${path}`,
-        'x-agentid': chatIdInPath ? path : AGENT_ID,
+        'x-agentid': path,
         'cookie': cookie,
         ...extra,
     };
@@ -379,7 +418,8 @@ export async function createConversation(cookie) {
         YUANBAO_CONVERSATION_CREATE,
         { agentId: AGENT_ID },
         {
-            headers: buildHeaders(cookie, '', securityHeaders),
+            // create 时尚无 chatId，referer/x-agentid 只带 agentId，避免 naQivTmsDa/ 尾斜杠
+            headers: buildHeaders(cookie, '', securityHeaders, { chatIdInPath: false }),
             timeout: 15000,
         },
     );
