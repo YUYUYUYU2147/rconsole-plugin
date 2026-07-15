@@ -488,6 +488,8 @@ export class tools extends plugin {
         this.weixinChannelYuanbaoCookie = this.toolsConfig.weixinChannelYuanbaoCookie;
         // 加载链接总结解析模式：general-通用（默认），yuanbao-元宝
         this.linkSummaryResolveMode = this.toolsConfig.linkSummaryResolveMode || 'general';
+        // 元宝模式可选模型：hunyuan_gpt_175B_0404 / deep_seek_v3
+        this.linkSummaryYuanbaoModel = this.toolsConfig.linkSummaryYuanbaoModel || 'hunyuan_gpt_175B_0404';
     }
 
     // 翻译插件
@@ -4230,21 +4232,27 @@ export class tools extends plugin {
 
         try {
             const isWeixinArticle = /mp\.weixin\.qq\.com/i.test(summaryLink);
+            // 运行时读取模型，避免构造时缓存导致锅巴切换不生效
+            const yuanbaoModel = toolsConfig.linkSummaryYuanbaoModel
+                || this.linkSummaryYuanbaoModel
+                || 'hunyuan_gpt_175B_0404';
+            const yuanbaoOptions = {
+                timeout: 120000,
+                model: yuanbaoModel,
+            };
+            logger.info(`[R插件][链接总结][元宝模式] 使用模型: ${yuanbaoModel}`);
             const summary = isWeixinArticle
-                ? await summarizeLinkByYuanbao(summaryLink, cookie, {
-                    timeout: 120000,
-                })
-                : await summarizeContentByYuanbao(await llmRead(summaryLink), cookie, {
-                    timeout: 120000,
-                });
+                ? await summarizeLinkByYuanbao(summaryLink, cookie, yuanbaoOptions)
+                : await summarizeContentByYuanbao(await llmRead(summaryLink), cookie, yuanbaoOptions);
 
             // 元宝返回的总结文本可能较长，使用合并转发发送
             // 头部标注「腾讯元宝」解析方式，让用户清楚是哪种模式产出的
             const stats = estimateReadingTime(summary);
             const titleMatch = summary.match(/(Title|标题)([:：])\s*(.*?)\n/)?.[3] || summary.match(/(Title|标题)([:：])\s*(.*)/)?.[3];
             e.reply(`《${titleMatch || '未知标题'}》 预计阅读时间: ${stats.minutes} 分钟，总字数: ${stats.words}`);
+            const modelLabel = yuanbaoModel === 'deep_seek_v3' ? 'DeepSeek V3' : '混元 175B';
             const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [
-                `「R插件 x 腾讯元宝」联合为您总结内容：`,
+                `「R插件 x 腾讯元宝（${modelLabel}）」联合为您总结内容：`,
                 summary,
             ]));
             await replyWithRetry(e, Bot, Msg);
