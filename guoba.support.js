@@ -722,7 +722,7 @@ export function supportGuoba() {
                     bottomHelpMessage:
                         "链接总结方式选择：\n" +
                         "• 通用模式（默认）：浏览器抓取页面正文或内容 + 自配 AI（kimi/openai）总结，依赖 aiApiKey 配置\n" +
-                        "• 元宝模式：直接把链接发给腾讯元宝抓取并总结，与视频号共用上面的元宝 Cookie，可规避部分页面风控（环境异常），但元宝对话接口有 IP 风控（部署服务器 IP 需与元宝登录 IP 一致）",
+                        "• 元宝模式：直接把链接发给腾讯元宝抓取并总结，与视频号共用上面的元宝 Cookie；需要 Playwright Chromium（用于生成 x-uskey 签名头），且部署服务器 IP 需尽量与元宝登录 IP 一致",
                     component: "Select",
                     componentProps: {
                         options: LINK_SUMMARY_RESOLVE_MODE_LIST,
