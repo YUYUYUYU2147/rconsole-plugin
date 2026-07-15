@@ -300,6 +300,15 @@ export const LINK_SUMMARY_RESOLVE_MODE_LIST = Object.freeze([
     { label: '通用模式', value: 'general' },
     { label: '元宝模式', value: 'yuanbao' },
 ]);
+
+/**
+ * 元宝链接总结可选模型（chatModelId）
+ * 值对齐 yuanbao.tencent.com 网页端实测字段
+ */
+export const LINK_SUMMARY_YUANBAO_MODEL_LIST = Object.freeze([
+    { label: '混元 175B（默认）', value: 'hunyuan_gpt_175B_0404' },
+    { label: 'DeepSeek V3', value: 'deep_seek_v3' },
+]);
 /**
  * 消息撤回时间
  * @type {number}

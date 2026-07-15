@@ -1,6 +1,6 @@
 import _ from "lodash";
 import path from "path";
-import { BILI_CDN_SELECT_LIST, BILI_DEFAULT_CDN_LIST, BILI_DOWNLOAD_METHOD, BILI_RESOLUTION_LIST, VIDEO_CODEC_LIST, YOUTUBE_GRAPHICS_LIST, NETEASECLOUD_QUALITY_LIST, KUGOU_QUALITY_LIST, DOUYIN_BGM_SEND_TYPE, DOUYIN_COMMENT_COUNT_LIST, DOUYIN_COMMENT_CHUNK_SIZE_LIST, BILI_COMMENT_COUNT_LIST, BILI_COMMENT_CHUNK_SIZE_LIST, LINK_SUMMARY_RESOLVE_MODE_LIST } from "./constants/constant.js";
+import { BILI_CDN_SELECT_LIST, BILI_DEFAULT_CDN_LIST, BILI_DOWNLOAD_METHOD, BILI_RESOLUTION_LIST, VIDEO_CODEC_LIST, YOUTUBE_GRAPHICS_LIST, NETEASECLOUD_QUALITY_LIST, KUGOU_QUALITY_LIST, DOUYIN_BGM_SEND_TYPE, DOUYIN_COMMENT_COUNT_LIST, DOUYIN_COMMENT_CHUNK_SIZE_LIST, BILI_COMMENT_COUNT_LIST, BILI_COMMENT_CHUNK_SIZE_LIST, LINK_SUMMARY_RESOLVE_MODE_LIST, LINK_SUMMARY_YUANBAO_MODEL_LIST } from "./constants/constant.js";
 import { RESOLVE_CONTROLLER_NAME_ENUM } from "./constants/resolve.js";
 import model from "./model/config.js";
 
@@ -726,6 +726,18 @@ export function supportGuoba() {
                     component: "Select",
                     componentProps: {
                         options: LINK_SUMMARY_RESOLVE_MODE_LIST,
+                    },
+                },
+                {
+                    field: "tools.linkSummaryYuanbaoModel",
+                    label: "元宝总结模型",
+                    bottomHelpMessage:
+                        "仅在「链接总结模式=元宝模式」时生效：\n" +
+                        "• 混元 175B（默认）：hunyuan_gpt_175B_0404，元宝网页默认模型\n" +
+                        "• DeepSeek V3：deep_seek_v3，对应网页端切换 DeepSeek 时的 chatModelId",
+                    component: "Select",
+                    componentProps: {
+                        options: LINK_SUMMARY_YUANBAO_MODEL_LIST,
                     },
                 },
                 {

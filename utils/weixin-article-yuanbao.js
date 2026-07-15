@@ -19,7 +19,7 @@ import { SUMMARY_PROMPT } from '../constants/constant.js';
  *
  * 解析流程（一次性会话）：
  *   1. POST /api/user/agent/conversation/create 新建会话 → 拿 chatId
- *   2. POST /api/user/agent/conversation/updateModel 初始化模型为 hunyuan_gpt_175B_0404
+ *   2. POST /api/user/agent/conversation/updateModel 初始化模型（默认 hunyuan_gpt_175B_0404，可选 deep_seek_v3）
  *   3. POST /api/chat/{chatId} 发送"总结：<文章URL>"消息，接收 SSE 流拼接元宝返回内容
  *   4. POST /api/user/agent/conversation/v1/clear 删除会话（无论成功失败都清理）
  *
@@ -60,6 +60,13 @@ const COMMON_HEADERS = {
 const AGENT_ID = 'naQivTmsDa';
 // 默认对话模型（混元 175B，元宝网页版默认模型）
 const DEFAULT_MODEL = 'hunyuan_gpt_175B_0404';
+// 支持的 chatModelId（对齐网页端）
+const SUPPORTED_MODELS = new Set([
+    'hunyuan_gpt_175B_0404',
+    'deep_seek_v3',
+]);
+// chat 接口里的 model 字段与 chatModelId 不同：混元仍用 gpt_175B_0404，DeepSeek 抓包也继续传 gpt_175B_0404
+const CHAT_API_MODEL = 'gpt_175B_0404';
 // 元宝前端 Qimei / Beacon appKey（抓包确认，用于 getUSKeySync）
 const QIMEI_APP_KEY = '0WEB05U9OEC1ZNRY';
 // 元宝前端 getUSKeySync 的固定业务 appId
@@ -83,6 +90,25 @@ function buildSummaryPrompt(input, { isContent = false } = {}) {
 请严格遵循以上角色、规则与输出格式要求，直接总结下面提供的${sourceLabel}，不要输出额外寒暄，也不要重复提示词内容。
 
 ${sourceLabel}：${input}`;
+}
+
+/**
+ * 归一化元宝模型 ID
+ * @param {string} [model]
+ * @returns {string}
+ */
+function resolveYuanbaoModel(model) {
+    const id = String(model || DEFAULT_MODEL).trim();
+    if (SUPPORTED_MODELS.has(id)) return id;
+    // 兼容简写
+    if (/^deepseek/i.test(id) || id === 'deep_seek' || id === 'ds' || id === 'deepseek_v3') {
+        return 'deep_seek_v3';
+    }
+    if (/hunyuan|混元/i.test(id)) {
+        return DEFAULT_MODEL;
+    }
+    logger.warn(`[R插件][链接总结][元宝] 未知模型 ${id}，回退到 ${DEFAULT_MODEL}`);
+    return DEFAULT_MODEL;
 }
 
 /**
@@ -432,18 +458,20 @@ export async function createConversation(cookie) {
 }
 
 /**
- * Step 2: 初始化会话模型（混元 175B + 自动联网搜索）
+ * Step 2: 初始化会话模型（支持混元 175B / DeepSeek V3）
  * 不调用此步骤直接发消息有时会返回空，沙箱实测必须先初始化模型
  * @param {string} cookie 腾讯元宝 Web 端 Cookie
  * @param {string} chatId 会话 ID
+ * @param {string} [model=DEFAULT_MODEL] chatModelId，如 deep_seek_v3
  */
-export async function initConversationModel(cookie, chatId) {
+export async function initConversationModel(cookie, chatId, model = DEFAULT_MODEL) {
+    const chatModelId = resolveYuanbaoModel(model);
     const payload = {
         cid: chatId,
-        chatModelId: DEFAULT_MODEL,
+        chatModelId,
         // chatModelExtInfo 是嵌套 JSON 字符串（元宝网页版原样格式）
         chatModelExtInfo: JSON.stringify({
-            modelId: DEFAULT_MODEL,
+            modelId: chatModelId,
             subModelId: '',
             supportFunctions: { internetSearch: 'autoInternetSearch' },
             internetSearch: 'autoInternetSearch',
@@ -455,7 +483,7 @@ export async function initConversationModel(cookie, chatId) {
         headers: buildHeaders(cookie, chatId, securityHeaders),
         timeout: 15000,
     });
-    logger.info(`[R插件][链接总结][元宝] 初始化模型成功: ${DEFAULT_MODEL}`);
+    logger.info(`[R插件][链接总结][元宝] 初始化模型成功: ${chatModelId}`);
 }
 
 /**
@@ -628,12 +656,14 @@ function parseSSEStream(stream, { onChunk } = {}) {
  * @returns {Promise<string>} 元宝总结的完整文本
  */
 export async function chatSummarize(cookie, chatId, input, options = {}) {
-    const { timeout = 120000, onChunk, isContent = false } = options;
+    const { timeout = 120000, onChunk, isContent = false, model = DEFAULT_MODEL } = options;
+    const chatModelId = resolveYuanbaoModel(model);
 
     const prompt = buildSummaryPrompt(input, { isContent });
     // payload 字段对齐元宝网页版实测抓包格式
+    // 注意：body.model 固定 gpt_175B_0404；真正切换模型靠 chatModelId / chatModelExtInfo.modelId
     const body = {
-        model: 'gpt_175B_0404',
+        model: CHAT_API_MODEL,
         prompt,
         plugin: '',
         displayPrompt: prompt,
@@ -641,7 +671,7 @@ export async function chatSummarize(cookie, chatId, input, options = {}) {
         agentId: AGENT_ID,
         isTemporary: false,
         projectId: '',
-        chatModelId: DEFAULT_MODEL,
+        chatModelId,
         supportFunctions: ['openAutoSearchSwitch', 'autoInternetSearch'],
         docOpenid: '',
         options: {
@@ -650,7 +680,7 @@ export async function chatSummarize(cookie, chatId, input, options = {}) {
         multimedia: [],
         supportHint: 1,
         chatModelExtInfo: JSON.stringify({
-            modelId: DEFAULT_MODEL,
+            modelId: chatModelId,
             subModelId: '',
             supportFunctions: { internetSearch: '' },
             internetSearch: 'autoInternetSearch',
@@ -727,12 +757,13 @@ export async function summarizeLink(url, cookie, options = {}) {
 
     let chatId = '';
     try {
+        const model = resolveYuanbaoModel(options.model);
         // Step 1: 新建会话
         chatId = await createConversation(cookie);
-        // Step 2: 初始化模型
-        await initConversationModel(cookie, chatId);
+        // Step 2: 初始化模型（混元 / DeepSeek 等）
+        await initConversationModel(cookie, chatId, model);
         // Step 3: 发送总结请求
-        const summary = await chatSummarize(cookie, chatId, normalizedUrl, options);
+        const summary = await chatSummarize(cookie, chatId, normalizedUrl, { ...options, model });
         logger.info(`[R插件][链接总结][元宝] 总结成功，文本长度: ${summary.length}`);
         return summary;
     } catch (err) {
@@ -775,11 +806,13 @@ export async function summarizeContent(content, cookie, options = {}) {
 
     let chatId = '';
     try {
+        const model = resolveYuanbaoModel(options.model);
         chatId = await createConversation(cookie);
-        await initConversationModel(cookie, chatId);
+        await initConversationModel(cookie, chatId, model);
         const summary = await chatSummarize(cookie, chatId, normalizedContent, {
             ...options,
             isContent: true,
+            model,
         });
         logger.info(`[R插件][链接总结][元宝] 内容总结成功，文本长度: ${summary.length}`);
         return summary;
