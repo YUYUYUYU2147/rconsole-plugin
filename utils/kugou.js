@@ -237,8 +237,10 @@ function extractKugouDurationText(songCandidate = {}) {
     if (!Number.isFinite(numeric) || numeric <= 0) {
         return "";
     }
-    // duration_ms 固定毫秒；其他字段默认秒，>10000 时按毫秒兜底
-    const totalSeconds = fieldName === "duration_ms" || numeric > 10000
+    // 明确毫秒字段固定 /1000；Duration/duration 等默认秒，>10000 再按毫秒兜底
+    // 注意：搜索主路径常用 Duration（秒）；timelen 在酷狗侧多为毫秒
+    const alwaysMsFields = new Set(["duration_ms", "timelen"]);
+    const totalSeconds = alwaysMsFields.has(fieldName) || numeric > 10000
         ? Math.floor(numeric / 1000)
         : Math.floor(numeric);
     const minutes = Math.floor(totalSeconds / 60);
