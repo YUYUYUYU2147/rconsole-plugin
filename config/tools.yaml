@@ -39,9 +39,10 @@ biliCommentCount: 5 # 哔哩哔哩评论展示数量，默认5条，数量越多
 biliCommentChunkSize: 10 # 哔哩哔哩评论单张截图展示数量，默认10条；超过这个数量会拆成多张截图发送
 
 useLocalNeteaseAPI: false # 是否使用网易云解析自建API
-useNeteaseSongRequest: false # 是否开启网易云点歌功能
+useNeteaseSongRequest: false # 是否开启点歌功能（#点歌/#听/#播放）
+songRequestPlatform: netease # 点歌平台：netease-网易云（默认），kugou-酷狗；仅影响 #点歌/#听/#播放，云盘仍走网易云
 isSendVocal: true # 是否开启发送群语音
-songRequestMaxList: 10 # 网易云点歌请求最大列表数
+songRequestMaxList: 10 # 点歌请求最大列表数
 neteaseCookie: '' # 网易云ck
 neteaseCloudCookie: '' # 网易云云盘ck
 neteaseCloudAPIServer: '' # 网易云自建服务器地址
