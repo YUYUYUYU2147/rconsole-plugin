@@ -56,6 +56,7 @@ export function createNeteasePlatform(context = {}) {
                 "User-Agent": COMMON_USER_AGENT,
                 ...(options.cookie ? { Cookie: options.cookie } : {}),
             },
+            timeout: 15000,
             validateStatus: () => true,
         });
         if (response.status >= 400) {
@@ -214,12 +215,12 @@ export function createNeteasePlatform(context = {}) {
         return tags;
     }
 
-    async function checkCookieAlive() {
-        if (!cookie || !apiServer) {
+    async function checkCookieAlive(requestCookie = cookie) {
+        if (!requestCookie || !apiServer) {
             return false;
         }
         try {
-            const data = await requestJson(`${apiServer}/login/status`, { cookie });
+            const data = await requestJson(`${apiServer}/login/status`, { cookie: requestCookie });
             return !!data?.data?.profile;
         } catch {
             return false;
@@ -227,10 +228,13 @@ export function createNeteasePlatform(context = {}) {
     }
 
     async function resolveTempUrl(title) {
-        const response = await axios.get(NETEASE_TEMP_API.replace("{}", title.replace("-", " ")), {
+        // 保留「- -> 空格」（与历史一致只替换首个），并对整段 title 做 URL 编码
+        const queryTitle = encodeURIComponent(String(title || "").replace("-", " "));
+        const response = await axios.get(NETEASE_TEMP_API.replace("{}", queryTitle), {
             headers: {
                 "User-Agent": COMMON_USER_AGENT,
             },
+            timeout: 15000,
             validateStatus: () => true,
         });
         return {
@@ -284,9 +288,10 @@ export function createNeteasePlatform(context = {}) {
             tags.push(level);
         }
 
+        // 校验必须用实际请求 Cookie（云盘场景用 cloudCookie），避免误判后覆盖已解析音源
         const cookieAlive = options.cookieAlive !== undefined
             ? options.cookieAlive
-            : await checkCookieAlive();
+            : await checkCookieAlive(requestCookie);
 
         // 与历史行为一致：ck 无效或无 url 时走临时接口
         if (!cookieAlive || !url) {

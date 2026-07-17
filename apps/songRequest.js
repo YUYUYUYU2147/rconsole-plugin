@@ -113,6 +113,57 @@ export class songRequest extends plugin {
         });
     }
 
+    /**
+     * 点歌列表 Redis key（按群隔离，避免并发读写整表覆盖）
+     * @param {string|number} groupId
+     */
+    getSongInfoRedisKey(groupId) {
+        return `${REDIS_YUNZAI_SONGINFO}:${groupId}`;
+    }
+
+    /**
+     * 读取当前群点歌会话；兼容旧版整表数组结构并迁移
+     * @param {string|number} groupId
+     */
+    async getGroupSongSession(groupId) {
+        const groupKey = this.getSongInfoRedisKey(groupId);
+        const direct = await redisGetKey(groupKey);
+        if (direct && Array.isArray(direct.data)) {
+            return direct;
+        }
+
+        // 兼容旧全局数组：[{ group_id, platform, data }]
+        const legacy = await redisGetKey(REDIS_YUNZAI_SONGINFO);
+        if (Array.isArray(legacy) && legacy.length) {
+            const found = legacy.find(item => String(item?.group_id) === String(groupId));
+            if (found && Array.isArray(found.data)) {
+                const session = {
+                    group_id: groupId,
+                    platform: found.platform || "netease",
+                    updatedAt: found.updatedAt || Date.now(),
+                    data: found.data,
+                };
+                await redisSetKey(groupKey, session);
+                return session;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 写入当前群点歌会话
+     * @param {string|number} groupId
+     * @param {object} session
+     */
+    async setGroupSongSession(groupId, session) {
+        await redisSetKey(this.getSongInfoRedisKey(groupId), {
+            group_id: groupId,
+            platform: session.platform || "netease",
+            updatedAt: session.updatedAt || Date.now(),
+            data: session.data || [],
+        });
+    }
+
     async pickSong(e) {
         this.refreshSongRequestConfig();
         if (!this.useNeteaseSongRequest) {
@@ -128,18 +179,19 @@ export class songRequest extends plugin {
             const songKeyWord = match[1];
             const songType = match[2] || '1';
             const platformId = this.songRequestPlatform;
-            const adapter = await this.createPlatformAdapter(platformId);
 
-            if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
-                e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
-                return true;
-            }
             if (platformId === 'kugou' && !this.kugouApiServer) {
                 e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
                 return true;
             }
 
             try {
+                const adapter = await this.createPlatformAdapter(platformId);
+                if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
+                    e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
+                    return true;
+                }
+
                 /** @type {any[]} */
                 let list = [];
 
@@ -180,21 +232,11 @@ export class songRequest extends plugin {
                     return true;
                 }
 
-                let songInfo = await redisGetKey(REDIS_YUNZAI_SONGINFO) || [];
-                if (!Array.isArray(songInfo)) songInfo = [];
-                const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
-                const musicDate = {
-                    group_id,
+                await this.setGroupSongSession(group_id, {
                     platform: platformId,
                     updatedAt: Date.now(),
                     data: list,
-                };
-                if (saveId === -1) {
-                    songInfo.push(musicDate);
-                } else {
-                    songInfo[saveId] = musicDate;
-                }
-                await redisSetKey(REDIS_YUNZAI_SONGINFO, songInfo);
+                });
 
                 const data = await new PickSongList(e).getData(list, platformId);
                 // saveId/tplFile 已按平台切换（酷狗用 pick-song-kugou）
@@ -213,28 +255,27 @@ export class songRequest extends plugin {
             return false;
         }
         const pickNumber = Number(listenMatch[1]) - 1;
-        let songInfo = await redisGetKey(REDIS_YUNZAI_SONGINFO) || [];
-        if (!Array.isArray(songInfo) || !songInfo.length) {
-            e.reply('请先使用 #点歌 搜索后再选择');
-            return true;
+        try {
+            const session = await this.getGroupSongSession(group_id);
+            if (!session?.data?.length) {
+                e.reply('请先使用 #点歌 搜索后再选择');
+                return true;
+            }
+            const selectedRaw = session.data[pickNumber];
+            if (!selectedRaw) {
+                e.reply('序号超出范围，请重新选择');
+                return true;
+            }
+            const selectedSong = normalizeLegacySongItem(selectedRaw, session.platform || 'netease');
+            if (!selectedSong) {
+                e.reply('歌曲数据异常，请重新点歌');
+                return true;
+            }
+            await this.playSelectedSong(e, selectedSong);
+        } catch (error) {
+            logger.error(`[R插件][点歌][听] 失败`, error);
+            e.reply(`播放失败：${error.message || '未知错误'}`);
         }
-        const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
-        if (saveId === -1 || !songInfo[saveId]?.data?.length) {
-            e.reply('当前群暂无点歌列表，请先 #点歌');
-            return true;
-        }
-        const session = songInfo[saveId];
-        const selectedRaw = session.data[pickNumber];
-        if (!selectedRaw) {
-            e.reply('序号超出范围，请重新选择');
-            return true;
-        }
-        const selectedSong = normalizeLegacySongItem(selectedRaw, session.platform || 'netease');
-        if (!selectedSong) {
-            e.reply('歌曲数据异常，请重新点歌');
-            return true;
-        }
-        await this.playSelectedSong(e, selectedSong);
         return true;
     }
 
@@ -254,18 +295,17 @@ export class songRequest extends plugin {
         const songKeyWord = match[1];
         const songType = match[2] || '1';
         const platformId = this.songRequestPlatform;
-        const adapter = await this.createPlatformAdapter(platformId);
-
-        if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
-            e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
-            return true;
-        }
         if (platformId === 'kugou' && !this.kugouApiServer) {
             e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
             return true;
         }
 
         try {
+            const adapter = await this.createPlatformAdapter(platformId);
+            if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
+                e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
+                return true;
+            }
             const list = await adapter.search(songKeyWord, {
                 limit: 1,
                 contentType: songType,
@@ -297,11 +337,11 @@ export class songRequest extends plugin {
             return;
         }
         const platformId = normalizeMusicPlatformId(song.platform || this.songRequestPlatform);
-        const adapter = await this.createPlatformAdapter(platformId);
         const isCloudSong = song.sourceType === 'cloud' || song.type === 'cloud';
 
         let playResult;
         try {
+            const adapter = await this.createPlatformAdapter(platformId);
             if (platformId === 'netease') {
                 // 云盘使用云盘 Cookie
                 const cloudCookie = this.neteaseCloudCookie || this.neteaseCookie;

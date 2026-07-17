@@ -215,19 +215,32 @@ function isKugouSongLike(item) {
 }
 
 function extractKugouDurationText(songCandidate = {}) {
-    const rawDuration = songCandidate.Duration
-        ?? songCandidate.duration
-        ?? songCandidate.timelen
-        ?? songCandidate.time_length
-        ?? songCandidate.TimeLength
-        ?? songCandidate.duration_ms
-        ?? "";
+    // 明确区分毫秒字段：duration_ms 无论大小都按毫秒转秒
+    const durationFieldCandidates = [
+        ["Duration", songCandidate.Duration],
+        ["duration", songCandidate.duration],
+        ["timelen", songCandidate.timelen],
+        ["time_length", songCandidate.time_length],
+        ["TimeLength", songCandidate.TimeLength],
+        ["duration_ms", songCandidate.duration_ms],
+    ];
+    let fieldName = "";
+    let rawDuration = "";
+    for (const [name, value] of durationFieldCandidates) {
+        if (value !== undefined && value !== null && value !== "") {
+            fieldName = name;
+            rawDuration = value;
+            break;
+        }
+    }
     const numeric = Number(rawDuration);
     if (!Number.isFinite(numeric) || numeric <= 0) {
         return "";
     }
-    // 搜索列表多为秒；超过 10000 时按毫秒处理
-    const totalSeconds = numeric > 10000 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+    // duration_ms 固定毫秒；其他字段默认秒，>10000 时按毫秒兜底
+    const totalSeconds = fieldName === "duration_ms" || numeric > 10000
+        ? Math.floor(numeric / 1000)
+        : Math.floor(numeric);
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
     return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
@@ -639,8 +652,12 @@ export async function searchKugouSong(apiServer, keyword, kugouCookie = "") {
     if (!result.list?.length) {
         return null;
     }
+    // 兼容旧调用链：保留候选 raw，供 getKugouAlternativeCandidates(searchResult.raw) 使用
+    // searchKugouSongs 列表项本身剥离了 raw，这里从响应 candidates 再取一次
+    const firstCandidate = findFirstSongCandidate(result.raw) || {};
     return {
         ...result.list[0],
+        raw: firstCandidate,
         cookie: result.cookie,
     };
 }
