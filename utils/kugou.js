@@ -199,14 +199,8 @@ function findFieldDeep(data, keys = []) {
     return null;
 }
 
-function findFirstSongCandidate(data) {
-    const listItems = data?.data?.lists;
-    if (Array.isArray(listItems) && listItems.length > 0) {
-        return listItems[0];
-    }
-    const objectList = collectObjects(data, []);
-    return objectList.find(item =>
-        item &&
+function isKugouSongLike(item) {
+    return !!(item &&
         (item.hash || item.Hash || item.FileHash || item.fileHash) &&
         (
             item.filename ||
@@ -215,16 +209,103 @@ function findFirstSongCandidate(data) {
             item.audio_name ||
             item.name ||
             item.FileName ||
-            item.OriSongName
-        )
-    ) || null;
+            item.OriSongName ||
+            item.SingerName
+        ));
+}
+
+function extractKugouDurationText(songCandidate = {}) {
+    // 明确区分毫秒字段：duration_ms 无论大小都按毫秒转秒
+    const durationFieldCandidates = [
+        ["Duration", songCandidate.Duration],
+        ["duration", songCandidate.duration],
+        ["timelen", songCandidate.timelen],
+        ["time_length", songCandidate.time_length],
+        ["TimeLength", songCandidate.TimeLength],
+        ["duration_ms", songCandidate.duration_ms],
+    ];
+    let fieldName = "";
+    let rawDuration = "";
+    for (const [name, value] of durationFieldCandidates) {
+        if (value !== undefined && value !== null && value !== "") {
+            fieldName = name;
+            rawDuration = value;
+            break;
+        }
+    }
+    const numeric = Number(rawDuration);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return "";
+    }
+    // 明确毫秒字段固定 /1000；Duration/duration 等默认秒，>10000 再按毫秒兜底
+    // 注意：搜索主路径常用 Duration（秒）；timelen 在酷狗侧多为毫秒
+    const alwaysMsFields = new Set(["duration_ms", "timelen"]);
+    const totalSeconds = alwaysMsFields.has(fieldName) || numeric > 10000
+        ? Math.floor(numeric / 1000)
+        : Math.floor(numeric);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+/**
+ * 从搜索响应中提取歌曲候选列表（优先 data.lists）
+ * @param {any} data
+ * @param {number} [limit=20]
+ * @returns {object[]}
+ */
+export function findSongCandidates(data, limit = 20) {
+    const max = Math.max(1, Number(limit) || 20);
+    const listItems = data?.data?.lists;
+    if (Array.isArray(listItems) && listItems.length > 0) {
+        return listItems.filter(isKugouSongLike).slice(0, max);
+    }
+
+    // 兜底：深度扫描，仅在没有 lists 时使用，避免误抓专辑对象
+    const objectList = collectObjects(data, []);
+    const seen = new Set();
+    const result = [];
+    for (const item of objectList) {
+        if (!isKugouSongLike(item)) {
+            continue;
+        }
+        const hash = item.hash || item.Hash || item.FileHash || item.fileHash || "";
+        if (!hash || seen.has(hash)) {
+            continue;
+        }
+        seen.add(hash);
+        result.push(item);
+        if (result.length >= max) {
+            break;
+        }
+    }
+    return result;
+}
+
+function findFirstSongCandidate(data) {
+    return findSongCandidates(data, 1)[0] || null;
 }
 
 function normalizeKugouSongCandidate(songCandidate = {}) {
     const hash = songCandidate.hash || songCandidate.Hash || songCandidate.FileHash || songCandidate.fileHash || "";
-    const songName = songCandidate.song_name || songCandidate.songname || songCandidate.name || songCandidate.filename || songCandidate.FileName || songCandidate.OriSongName || "";
-    const authorName = songCandidate.author_name || songCandidate.singername || songCandidate.singer_name || songCandidate.SingerName || "";
-    const audioName = songCandidate.audio_name || songCandidate.filename || songCandidate.FileName || [authorName, songName].filter(Boolean).join(" - ");
+    // FileName 形如「歌手 - 歌名」，优先用更干净的 OriSongName / songname
+    const songName = songCandidate.OriSongName
+        || songCandidate.song_name
+        || songCandidate.songname
+        || songCandidate.name
+        || songCandidate.SongName
+        || songCandidate.filename
+        || songCandidate.FileName
+        || "";
+    const authorName = songCandidate.author_name
+        || songCandidate.singername
+        || songCandidate.singer_name
+        || songCandidate.SingerName
+        || "";
+    const audioName = songCandidate.audio_name
+        || songCandidate.FileName
+        || songCandidate.filename
+        || [authorName, songName].filter(Boolean).join(" - ");
 
     return {
         hash,
@@ -232,10 +313,17 @@ function normalizeKugouSongCandidate(songCandidate = {}) {
         authorName,
         audioName,
         albumId: songCandidate.album_id || songCandidate.albumid || songCandidate.AlbumID || "",
-        albumAudioId: songCandidate.album_audio_id || songCandidate.mixsongid || songCandidate.audio_id || songCandidate.MixSongID || songCandidate.Audioid || "",
+        albumAudioId: songCandidate.album_audio_id
+            || songCandidate.mixsongid
+            || songCandidate.MixSongID
+            || songCandidate.audio_id
+            || songCandidate.Audioid
+            || "",
+        duration: extractKugouDurationText(songCandidate),
         cover: normalizeKugouCoverUrl(
             songCandidate.union_cover
             || songCandidate.album_img
+            || songCandidate.AlbumImage
             || songCandidate.imgUrl
             || songCandidate.imgurl
             || songCandidate.img
@@ -507,23 +595,72 @@ export async function registerKugouDevice(apiServer) {
     };
 }
 
-export async function searchKugouSong(apiServer, keyword, kugouCookie = "") {
+/**
+ * 酷狗多结果搜索
+ * @param {string} apiServer
+ * @param {string} keyword
+ * @param {{ cookie?: string, limit?: number, page?: number }} [options]
+ * @returns {Promise<{ list: object[], cookie: string, raw: any }>}
+ */
+export async function searchKugouSongs(apiServer, keyword, options = {}) {
+    const {
+        cookie: kugouCookie = "",
+        limit = 10,
+        page = 1,
+    } = options;
+    const pageSize = Math.max(1, Math.min(50, Number(limit) || 10));
     const params = {
         keywords: keyword,
         type: "song",
-        page: 1,
-        pagesize: 1,
+        page,
+        pagesize: pageSize,
         ...(kugouCookie ? { cookie: kugouCookie } : {}),
     };
     const response = await requestKugouApi(apiServer, "/search", params, kugouCookie);
-    const songCandidate = findFirstSongCandidate(response.data);
-
-    if (!songCandidate) {
-        return null;
+    const candidates = findSongCandidates(response.data, pageSize);
+    const seen = new Set();
+    const list = [];
+    for (const candidate of candidates) {
+        const normalized = normalizeKugouSongCandidate(candidate);
+        if (!normalized.hash || seen.has(normalized.hash)) {
+            continue;
+        }
+        seen.add(normalized.hash);
+        // 点歌缓存不需要 raw，避免 Redis 膨胀
+        const { raw, ...rest } = normalized;
+        list.push(rest);
+        if (list.length >= pageSize) {
+            break;
+        }
     }
     return {
-        ...normalizeKugouSongCandidate(songCandidate),
+        list,
         cookie: response.cookie,
+        raw: response.data,
+    };
+}
+
+/**
+ * 兼容旧签名：只返回第一条搜索结果
+ * @param {string} apiServer
+ * @param {string} keyword
+ * @param {string} [kugouCookie=""]
+ */
+export async function searchKugouSong(apiServer, keyword, kugouCookie = "") {
+    const result = await searchKugouSongs(apiServer, keyword, {
+        cookie: kugouCookie,
+        limit: 1,
+    });
+    if (!result.list?.length) {
+        return null;
+    }
+    // 兼容旧调用链：保留候选 raw，供 getKugouAlternativeCandidates(searchResult.raw) 使用
+    // searchKugouSongs 列表项本身剥离了 raw，这里从响应 candidates 再取一次
+    const firstCandidate = findFirstSongCandidate(result.raw) || {};
+    return {
+        ...result.list[0],
+        raw: firstCandidate,
+        cookie: result.cookie,
     };
 }
 

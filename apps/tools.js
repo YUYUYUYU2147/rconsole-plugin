@@ -9,6 +9,35 @@ import PQueue from 'p-queue';
 import path from "path";
 import qrcode from "qrcode";
 import querystring from "querystring";
+import { Scraper } from '@the-convocation/twitter-scraper';
+import { cycleTLSFetch, cycleTLSExit } from '@the-convocation/twitter-scraper/cycletls';
+
+let activeTwitterCycleTlsParses = 0;
+let twitterCycleTlsExitPromise = null;
+const acquireTwitterCycleTls = async () => {
+    if (twitterCycleTlsExitPromise) {
+        await twitterCycleTlsExitPromise;
+    }
+    activeTwitterCycleTlsParses += 1;
+};
+const releaseTwitterCycleTls = async () => {
+    activeTwitterCycleTlsParses = Math.max(0, activeTwitterCycleTlsParses - 1);
+    if (activeTwitterCycleTlsParses !== 0) {
+        return;
+    }
+    if (!twitterCycleTlsExitPromise) {
+        twitterCycleTlsExitPromise = Promise.resolve()
+            .then(() => cycleTLSExit())
+            .catch(err => {
+                logger.warn(`[R插件][X] CycleTLS 退出失败: ${err.message}`);
+            })
+            .finally(() => {
+                twitterCycleTlsExitPromise = null;
+            });
+    }
+    await twitterCycleTlsExitPromise;
+};
+
 import puppeteer from "../../../lib/puppeteer/puppeteer.js";
 import { replyWithRetry } from "../utils/retry.js";
 import {
@@ -135,6 +164,7 @@ import { convertToSeconds, removeParams, ytbFormatTime } from "../utils/youtube.
 import { ytDlpGetDuration, ytDlpGetThumbnail, ytDlpGetThumbnailUrl, ytDlpGetTilt, ytDlpHelper } from "../utils/yt-dlp-util.js";
 import { textArrayToMakeForward, downloadImagesAndMakeForward, cleanupTempFiles, sendImagesInBatches, sendCustomMusicCard } from "../utils/yunzai-util.js";
 import { getApiParams, optimizeImageUrl } from "../utils/xiaoheihe.js";
+import { extractInstagramUrl, fetchInstagramMedia, normalizeInstagramMedia } from "../utils/instagram.js";
 
 /**
  * fetch重试函数
@@ -210,8 +240,12 @@ export class tools extends plugin {
                     fnc: "bili",
                 },
                 {
-                    reg: "https?:\\/\\/x.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)",
+                    reg: "https?:\\/\\/(x|r|twitter)\\.com\\/[0-9-a-zA-Z_]{1,20}\\/status\\/([0-9]*)(\\?.*)?",
                     fnc: "twitter_x",
+                },
+                {
+                    reg: "https?:\\/\\/(www\\.)?instagram\\.com\\/(p|reel|reels)\\/",
+                    fnc: "instagram",
                 },
                 {
                     reg: "(acfun.cn|^ac[0-9]{8}$)",
@@ -444,6 +478,8 @@ export class tools extends plugin {
         this.globalImageLimit = this.toolsConfig.globalImageLimit;
         // 加载微博Cookie
         this.weiboCookie = this.toolsConfig.weiboCookie;
+        // 加载 X(Twitter) Cookie，格式：name=value; name2=value2
+        this.xCookie = this.toolsConfig.xCookie || '';
         // 是否开启微博评论
         this.weiboComments = this.toolsConfig.weiboComments ?? true;
         // 加载小黑盒Cookie
@@ -452,6 +488,8 @@ export class tools extends plugin {
         this.weixinChannelYuanbaoCookie = this.toolsConfig.weixinChannelYuanbaoCookie;
         // 加载链接总结解析模式：general-通用（默认），yuanbao-元宝
         this.linkSummaryResolveMode = this.toolsConfig.linkSummaryResolveMode || 'general';
+        // 元宝模式可选模型：hunyuan_gpt_175B_0404 / deep_seek_v3
+        this.linkSummaryYuanbaoModel = this.toolsConfig.linkSummaryYuanbaoModel || 'hunyuan_gpt_175B_0404';
     }
 
     // 翻译插件
@@ -2266,7 +2304,7 @@ export class tools extends plugin {
         return true;
     }
 
-    // 使用现有api解析小蓝鸟
+    // 使用 twitter-scraper 解析 X（Twitter）
     async twitter_x(e) {
         // 切面判断是否需要解析
         if (!(await this.isEnableResolve(RESOLVE_CONTROLLER_NAME_ENUM.twitter_x))) {
@@ -2277,63 +2315,297 @@ export class tools extends plugin {
             e.reply("你没有权限使用此命令");
             return;
         }
-        // 配置参数及解析
-        const reg = /https:\/\/x\.com\/[\w]+\/status\/\d+(\/photo\/\d+)?/;
-        const twitterUrl = reg.exec(e.msg)[0];
-        // 检测
+
+        const reg = /https?:\/\/(x|r|twitter)\.com\/([\w]+)\/status\/(\d+)(\/photo\/\d+)?(\?[^\s]*)?/;
+        const match = reg.exec(e.msg);
+        if (!match) {
+            await e.reply("❌ 无法识别 X 链接");
+            return true;
+        }
+
+        const rawUrl = match[0].replace(/^http:\/\//, 'https://');
+        const twitterUrl = rawUrl.replace(/https:\/\/(r|twitter)\.com\//, 'https://x.com/');
+        const tweetId = match[3];
         const isOversea = await this.isOverseasServer();
-        if (!isOversea && !(await testProxy(this.proxyAddr, this.proxyPort))) {
-            e.reply("检测到没有梯子，无法解析小蓝鸟");
+
+        try {
+            await acquireTwitterCycleTls();
+            const twitterFetch = (input, init = {}) => {
+                const requestInit = { ...init };
+                if (!isOversea && this.myProxy) {
+                    requestInit.proxy = this.myProxy;
+                }
+                return cycleTLSFetch(input, requestInit);
+            };
+            const scraper = new Scraper({
+                fetch: twitterFetch,
+            });
+
+            if (!_.isEmpty(this.xCookie)) {
+                try {
+                    const cookies = this.xCookie
+                        .split(';')
+                        .map(c => c.trim())
+                        .filter(Boolean);
+                    await scraper.setCookies(cookies);
+                    logger.info(`[R插件][X] 已注入 ${cookies.length} 个 cookie`);
+                } catch (err) {
+                    logger.warn(`[R插件][X] Cookie 解析失败，继续匿名抓取: ${err.message}`);
+                }
+            }
+
+            let tweet = null;
+            try {
+                const maxAttempts = 3;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        tweet = await scraper.getTweet(tweetId);
+                        if (attempt > 1) {
+                            logger.info(`[R插件][X] 第 ${attempt} 次重试抓取成功`);
+                        }
+                        break;
+                    } catch (innerErr) {
+                        const errMsg = String(innerErr?.message || '');
+                        const isRetryable = errMsg.includes('TLS') || errMsg.includes('Handshake') || errMsg.includes('EOF') || errMsg.includes('Client network socket disconnected') || errMsg.includes('495');
+                        if (!isRetryable || attempt === maxAttempts) {
+                            throw innerErr;
+                        }
+                        logger.warn(`[R插件][X] 抓取失败，重试 ${attempt}/${maxAttempts - 1}: ${innerErr.message}`);
+                        await new Promise(resolve => setTimeout(resolve, 1500));
+                    }
+                }
+            } catch (err) {
+                logger.error(`[R插件][X] 抓取推文失败: ${err.message}`);
+                throw err;
+            }
+
+            if (!tweet) {
+                await e.reply("❌ 抓取失败，未获取到推文内容。可能需要配置 X Cookie");
+                return true;
+            }
+
+            logger.info(`[R插件][X] 抓取成功: ${twitterUrl} | photos=${tweet.photos?.length || 0} | videos=${tweet.videos?.length || 0}`);
+
+            const previewText = _.trim(tweet.text || '');
+            const buildPreviewMsg = async () => {
+                if (!previewText) return `${this.identifyPrefix}识别：小蓝鸟`;
+                let previewMsg = `${this.identifyPrefix}识别：小蓝鸟，${previewText}`;
+                try {
+                    const translatedText = await this.translateEngine.translate(previewText, '中');
+                    if (_.trim(translatedText) && _.trim(translatedText) !== '翻译失败') {
+                        previewMsg += `\n——————\n翻译：${_.trim(translatedText)}`;
+                    }
+                } catch (err) {
+                    logger.warn(`[R插件][X] 文案翻译失败: ${err.message}`);
+                }
+                return previewMsg;
+            };
+
+            const hasVideos = tweet.videos?.length > 0;
+            const hasPhotos = tweet.photos?.length > 0;
+
+            if (hasVideos || hasPhotos) {
+                await e.reply(await buildPreviewMsg());
+            }
+
+            if (hasVideos) {
+                const videosWithUrl = tweet.videos.filter(v => v.url);
+                if (videosWithUrl.length === 0 && !hasPhotos) {
+                    await e.reply("❌ 推文包含视频，但未解析到可下载地址");
+                    return true;
+                }
+                for (const video of videosWithUrl) {
+                    try {
+                        const videoPath = await this.downloadVideo(video.url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4');
+                        await e.reply(segment.video(videoPath));
+                    } catch (err) {
+                        logger.error(`[R插件][X] 视频下载失败: ${err.message}`);
+                        await e.reply('❌ 小蓝鸟视频下载失败，请稍后重试');
+                    }
+                }
+            }
+
+            if (hasPhotos) {
+                const imageUrls = tweet.photos.map(p => p.url).filter(Boolean);
+                const forwardNodes = [];
+                const downloadedImagePaths = [];
+
+                try {
+                    for (const url of imageUrls) {
+                        let imageSeg;
+                        if (isOversea) {
+                            imageSeg = segment.image(url);
+                        } else {
+                            const localPath = this.getCurDownloadPath(e);
+                            const xImgPath = await downloadImg({
+                                img: url,
+                                dir: localPath,
+                                isProxy: !isOversea,
+                                proxyInfo: {
+                                    proxyAddr: this.proxyAddr,
+                                    proxyPort: this.proxyPort
+                                },
+                                downloadMethod: this.biliDownloadMethod,
+                            });
+                            downloadedImagePaths.push(xImgPath);
+                            imageSeg = segment.image(xImgPath);
+                        }
+                        forwardNodes.push({
+                            message: imageSeg,
+                            nickname: e.sender.card || e.sender.nickname || String(e.user_id),
+                            user_id: e.user_id,
+                        });
+                    }
+
+                    await e.reply(await Bot.makeForwardMsg(forwardNodes));
+                } finally {
+                    for (const filePath of downloadedImagePaths) {
+                        try {
+                            await checkAndRemoveFile(filePath);
+                        } catch (cleanupErr) {
+                            logger.warn(`[R插件][X] 清理临时图片失败: ${cleanupErr.message}`);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            if (hasVideos || hasPhotos) {
+                return true;
+            }
+
+            if (previewText) {
+                await e.reply(await buildPreviewMsg());
+                return true;
+            }
+
+            await e.reply("❌ 未解析到图片、视频或文本内容。可能需要配置 X Cookie");
+            return true;
+        } catch (err) {
+            logger.error(`[R插件][X] 解析失败: ${err.message}`);
+            const errMsg = String(err?.message || '');
+            let userHint = '❌ 小蓝鸟解析失败，请稍后重试';
+            if (errMsg.includes('TLS') || errMsg.includes('Handshake') || errMsg.includes('EOF') || errMsg.includes('Client network socket disconnected') || errMsg.includes('495')) {
+                userHint = '❌ 小蓝鸟连接不稳定，请稍后重试';
+            }
+            await e.reply(userHint);
+            return true;
+        } finally {
+            await releaseTwitterCycleTls();
+        }
+    }
+
+    // Instagram 解析（第三方临时接口，随时可能下架）
+    async instagram(e) {
+        // 切面判断是否需要解析
+        if (!(await this.isEnableResolve(RESOLVE_CONTROLLER_NAME_ENUM.instagram))) {
+            logger.info(`[R插件][全局解析控制] ${RESOLVE_CONTROLLER_NAME_ENUM.instagram} 已拦截`);
             return false;
         }
-        // 提取视频
-        let videoUrl = GENERAL_REQ_LINK.link.replace("{}", twitterUrl);
-        e.reply(`${this.identifyPrefix}识别：小蓝鸟学习版`);
-        const config = {
-            headers: {
-                'Accept': 'ext/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Encoding': 'gzip, deflate',
-                'Accept-Language': 'zh-CN,zh;q=0.9',
-                'Host': '47.99.158.118',
-                'Proxy-Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'User-Agent': COMMON_USER_AGENT,
-            },
-            timeout: 10000 // 设置超时时间
-        };
+        if (!(await this.isTrustUser(e.user_id))) {
+            e.reply("你没有权限使用此命令");
+            return;
+        }
+        // Instagram 在国内无法直连，统一按海外/代理处理
+        const isOversea = await this.isOverseasServer();
+        if (!isOversea && !(await testProxy(this.proxyAddr, this.proxyPort))) {
+            e.reply("检测到没有梯子，无法解析 Instagram");
+            return false;
+        }
 
-        let resp = await axios.get(videoUrl, config);
-        if (resp.data.data == null) {
-            videoUrl += '/photo/1';
-            logger.info(videoUrl);
-            resp = await axios.get(videoUrl, config);
+        const igUrl = extractInstagramUrl(e.msg);
+        if (!igUrl) {
+            await e.reply("❌ 无法识别 Instagram 链接");
+            return true;
         }
-        const url = resp.data.data?.url;
-        if (url && (url.endsWith(".jpg") || url.endsWith(".png"))) {
-            if (isOversea) {
-                // 海外直接下载
-                e.reply(segment.image(url));
-            } else {
-                // 非海外使用🪜下载
-                const localPath = this.getCurDownloadPath(e);
-                const xImgPath = await downloadImg({
-                    img: url,
-                    dir: localPath,
-                    isProxy: !isOversea,
-                    proxyInfo: {
-                        proxyAddr: this.proxyAddr,
-                        proxyPort: this.proxyPort
-                    },
-                    downloadMethod: this.biliDownloadMethod,
-                });
-                e.reply(segment.image(xImgPath));
+
+        try {
+            const raw = await fetchInstagramMedia(igUrl);
+            const media = normalizeInstagramMedia(raw);
+            if (!media) {
+                logger.error(`[R插件][Instagram] 解析失败，原始返回: ${JSON.stringify(raw).slice(0, 500)}`);
+                await e.reply("❌ Instagram 解析失败，第三方临时接口可能已下架或失效，请稍后重试");
+                return true;
             }
-        } else {
-            this.downloadVideo(url, !isOversea, null, this.videoDownloadConcurrency, 'twitter.mp4').then(videoPath => {
-                e.reply(segment.video(videoPath));
-            });
+
+            // 预览文案（只发一次）
+            let previewMsg = `${this.identifyPrefix}识别：Instagram`;
+            if (media.title) {
+                previewMsg += `，${media.title}`;
+                try {
+                    const translatedText = await this.translateEngine.translate(media.title, '中');
+                    if (_.trim(translatedText) && _.trim(translatedText) !== '翻译失败') {
+                        previewMsg += `\n——————\n翻译：${_.trim(translatedText)}`;
+                    }
+                } catch (err) {
+                    logger.warn(`[R插件][Instagram] 文案翻译失败: ${err.message}`);
+                }
+            }
+            await e.reply(previewMsg);
+
+            // 视频类型
+            if (media.noteType === "video" && media.videoUrl) {
+                try {
+                    const videoPath = await this.downloadVideo(media.videoUrl, !isOversea, null, this.videoDownloadConcurrency, 'instagram.mp4');
+                    await e.reply(segment.video(videoPath));
+                } catch (err) {
+                    logger.error(`[R插件][Instagram] 视频下载失败: ${err.message}`);
+                    await e.reply('❌ Instagram 视频下载失败，请稍后重试');
+                }
+                return true;
+            }
+
+            // 图文类型
+            if (media.noteType === "image" && media.images.length > 0) {
+                const downloadPath = this.getCurDownloadPath(e);
+                const downloadedImagePaths = [];
+                const forwardNodes = [];
+                try {
+                    for (const url of media.images) {
+                        let imageSeg;
+                        if (isOversea) {
+                            imageSeg = segment.image(url);
+                        } else {
+                            const imgPath = await downloadImg({
+                                img: url,
+                                dir: downloadPath,
+                                isProxy: !isOversea,
+                                proxyInfo: {
+                                    proxyAddr: this.proxyAddr,
+                                    proxyPort: this.proxyPort,
+                                },
+                                downloadMethod: this.biliDownloadMethod,
+                            });
+                            downloadedImagePaths.push(imgPath);
+                            imageSeg = segment.image(imgPath);
+                        }
+                        forwardNodes.push({
+                            message: imageSeg,
+                            nickname: e.sender.card || e.sender.nickname || String(e.user_id),
+                            user_id: e.user_id,
+                        });
+                    }
+                    await e.reply(await Bot.makeForwardMsg(forwardNodes));
+                } finally {
+                    for (const filePath of downloadedImagePaths) {
+                        try {
+                            await checkAndRemoveFile(filePath);
+                        } catch (cleanupErr) {
+                            logger.warn(`[R插件][Instagram] 清理临时图片失败: ${cleanupErr.message}`);
+                        }
+                    }
+                }
+                return true;
+            }
+
+            // 既无视频也无图片：预览文案已发送，无额外媒体可下发
+            await e.reply("❌ 未解析到图片或视频，第三方临时接口可能已下架或失效");
+            return true;
+        } catch (err) {
+            logger.error(`[R插件][Instagram] 解析失败: ${err.message}`);
+            await e.reply("❌ Instagram 解析失败，第三方临时接口可能已下架或失效，请稍后重试");
+            return true;
         }
-        return true;
     }
 
     // acfun解析
@@ -3960,21 +4232,27 @@ export class tools extends plugin {
 
         try {
             const isWeixinArticle = /mp\.weixin\.qq\.com/i.test(summaryLink);
+            // 运行时读取模型，避免构造时缓存导致锅巴切换不生效
+            const yuanbaoModel = toolsConfig.linkSummaryYuanbaoModel
+                || this.linkSummaryYuanbaoModel
+                || 'hunyuan_gpt_175B_0404';
+            const yuanbaoOptions = {
+                timeout: 120000,
+                model: yuanbaoModel,
+            };
+            logger.info(`[R插件][链接总结][元宝模式] 使用模型: ${yuanbaoModel}`);
             const summary = isWeixinArticle
-                ? await summarizeLinkByYuanbao(summaryLink, cookie, {
-                    timeout: 120000,
-                })
-                : await summarizeContentByYuanbao(await llmRead(summaryLink), cookie, {
-                    timeout: 120000,
-                });
+                ? await summarizeLinkByYuanbao(summaryLink, cookie, yuanbaoOptions)
+                : await summarizeContentByYuanbao(await llmRead(summaryLink), cookie, yuanbaoOptions);
 
             // 元宝返回的总结文本可能较长，使用合并转发发送
             // 头部标注「腾讯元宝」解析方式，让用户清楚是哪种模式产出的
             const stats = estimateReadingTime(summary);
             const titleMatch = summary.match(/(Title|标题)([:：])\s*(.*?)\n/)?.[3] || summary.match(/(Title|标题)([:：])\s*(.*)/)?.[3];
             e.reply(`《${titleMatch || '未知标题'}》 预计阅读时间: ${stats.minutes} 分钟，总字数: ${stats.words}`);
+            const modelLabel = yuanbaoModel === 'deep_seek_v3' ? 'DeepSeek V3' : '混元 175B';
             const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [
-                `「R插件 x 腾讯元宝」联合为您总结内容：`,
+                `「R插件 x 腾讯元宝（${modelLabel}）」联合为您总结内容：`,
                 summary,
             ]));
             await replyWithRetry(e, Bot, Msg);

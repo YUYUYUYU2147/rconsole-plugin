@@ -6,17 +6,21 @@ import PickSongList from "../model/pick-song.js";
 import NeteaseMusicInfo from '../model/neteaseMusicInfo.js'
 import { NETEASE_API_CN, NETEASE_SONG_DOWNLOAD, NETEASE_TEMP_API } from "../constants/tools.js";
 import { COMMON_USER_AGENT, REDIS_YUNZAI_ISOVERSEA, REDIS_YUNZAI_SONGINFO, REDIS_YUNZAI_CLOUDSONGLIST } from "../constants/constant.js";
-import { cleanFilename, downloadAudio, retryAxiosReq } from "../utils/common.js";
+import { downloadAudio, retryAxiosReq } from "../utils/common.js";
 import { redisExistKey, redisGetKey, redisSetKey } from "../utils/redis-util.js";
 import { checkAndRemoveFile, checkFileExists, splitPaths } from "../utils/file.js";
 import { sendMusicCard, sendCustomMusicCard, getGroupFileUrl, getReplyMsg } from "../utils/yunzai-util.js";
-import { getKugouSongUrl, searchKugouSongList } from "../utils/kugou.js";
+import {
+    createSongItem,
+    getMusicPlatform,
+    normalizeLegacySongItem,
+    normalizeMusicPlatformId,
+} from "../utils/music-platform/index.js";
 import config from "../model/config.js";
 import FormData from 'form-data';
 import NodeID3 from 'node-id3';
 
 let FileSuffix = 'flac'
-const REDIS_YUNZAI_KUGOU_SONGINFO = "Yunzai:R-Plugin:kugouSongInfo";
 
 export class songRequest extends plugin {
     constructor() {
@@ -32,14 +36,6 @@ export class songRequest extends plugin {
                 {
                     reg: "^#播放\\s*(.+?)(?:\\s+([12]))?$",
                     fnc: "playSong"
-                },
-                {
-                    reg: "^#?(?:酷狗|kg|KG)点歌\\s*(.+)$|^#?(?:酷狗|kg|KG)听[1-9][0-9]*$",
-                    fnc: "pickKugouSong"
-                },
-                {
-                    reg: "^#?(?:酷狗|kg|KG)播放\\s*(.+)$",
-                    fnc: "playKugouSong"
                 },
                 {
                     reg: "^#?上传$",
@@ -67,309 +63,434 @@ export class songRequest extends plugin {
                 }
             ]
         });
-        this.toolsConfig = config.getConfig("tools");
-        // 加载网易云Cookie
-        this.neteaseCookie = this.toolsConfig.neteaseCookie
-        this.neteaseCloudCookie = this.toolsConfig.neteaseCloudCookie
-        // 加载是否转化群语音
-        this.isSendVocal = this.toolsConfig.isSendVocal
-        // 加载是否自建服务器
-        this.useLocalNeteaseAPI = this.toolsConfig.useLocalNeteaseAPI
-        // 加载自建服务器API
-        this.neteaseCloudAPIServer = this.toolsConfig.neteaseCloudAPIServer
-        // 加载网易云解析最高音质
-        this.neteaseCloudAudioQuality = this.toolsConfig.neteaseCloudAudioQuality
-        // 加载识别前缀
+        this.refreshSongRequestConfig();
+    }
+
+    /**
+     * 热读取点歌相关配置（锅巴改完无需重启）
+     * 使用 getYaml(..., false) 避免重复注册 watcher
+     */
+    refreshSongRequestConfig() {
+        this.toolsConfig = config.getYaml("tools", false) || config.getConfig("tools") || {};
+        this.neteaseCookie = this.toolsConfig.neteaseCookie;
+        this.neteaseCloudCookie = this.toolsConfig.neteaseCloudCookie;
+        this.isSendVocal = this.toolsConfig.isSendVocal;
+        this.useLocalNeteaseAPI = this.toolsConfig.useLocalNeteaseAPI;
+        this.neteaseCloudAPIServer = this.toolsConfig.neteaseCloudAPIServer;
+        this.neteaseCloudAudioQuality = this.toolsConfig.neteaseCloudAudioQuality;
         this.identifyPrefix = this.toolsConfig.identifyPrefix;
-        // 加载是否开启网易云点歌功能
-        this.useNeteaseSongRequest = this.toolsConfig.useNeteaseSongRequest
-        // 加载点歌列表长度
-        this.songRequestMaxList = this.toolsConfig.songRequestMaxList
-        // 视频保存路径
+        // 兼容旧字段名：总开关
+        this.useNeteaseSongRequest = this.toolsConfig.useNeteaseSongRequest;
+        this.songRequestMaxList = this.toolsConfig.songRequestMaxList || 10;
         this.defaultPath = this.toolsConfig.defaultPath;
-        // uid
-        this.uid = this.toolsConfig.neteaseUserId
-        this.cloudUid = this.toolsConfig.neteaseCloudUserId
-        this.kugouApiServer = this.toolsConfig.kugouApiServer
-        this.kugouAudioQuality = this.toolsConfig.kugouAudioQuality || 'viper_clear'
-        this.kugouCookie = this.toolsConfig.kugouCookie
+        this.uid = this.toolsConfig.neteaseUserId;
+        this.cloudUid = this.toolsConfig.neteaseCloudUserId;
+        this.songRequestPlatform = normalizeMusicPlatformId(this.toolsConfig.songRequestPlatform || "netease");
+        this.kugouApiServer = this.toolsConfig.kugouApiServer || "";
+        this.kugouCookie = this.toolsConfig.kugouCookie || "";
+        this.kugouAudioQuality = this.toolsConfig.kugouAudioQuality || "flac";
+    }
+
+    /**
+     * 构造当前平台适配器上下文
+     * @param {string} [platform]
+     */
+    async createPlatformAdapter(platform) {
+        const platformId = normalizeMusicPlatformId(platform || this.songRequestPlatform);
+        if (platformId === "kugou") {
+            return getMusicPlatform("kugou", {
+                apiServer: this.kugouApiServer,
+                cookie: this.kugouCookie,
+                quality: this.kugouAudioQuality,
+            });
+        }
+        // 默认 / 网易云
+        const apiServer = await this.pickApi();
+        return getMusicPlatform("netease", {
+            apiServer,
+            cookie: this.neteaseCookie,
+            quality: this.neteaseCloudAudioQuality,
+        });
+    }
+
+    /**
+     * 点歌列表 Redis key（按群隔离，避免并发读写整表覆盖）
+     * @param {string|number} groupId
+     */
+    getSongInfoRedisKey(groupId) {
+        return `${REDIS_YUNZAI_SONGINFO}:${groupId}`;
+    }
+
+    /**
+     * 读取当前群点歌会话；兼容旧版整表数组结构并迁移
+     * @param {string|number} groupId
+     */
+    async getGroupSongSession(groupId) {
+        const groupKey = this.getSongInfoRedisKey(groupId);
+        const direct = await redisGetKey(groupKey);
+        if (direct && Array.isArray(direct.data)) {
+            return direct;
+        }
+
+        // 兼容旧全局数组：[{ group_id, platform, data }]
+        const legacy = await redisGetKey(REDIS_YUNZAI_SONGINFO);
+        if (Array.isArray(legacy) && legacy.length) {
+            const found = legacy.find(item => String(item?.group_id) === String(groupId));
+            if (found && Array.isArray(found.data)) {
+                const session = {
+                    group_id: groupId,
+                    platform: found.platform || "netease",
+                    updatedAt: found.updatedAt || Date.now(),
+                    data: found.data,
+                };
+                await redisSetKey(groupKey, session);
+                return session;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 写入当前群点歌会话
+     * @param {string|number} groupId
+     * @param {object} session
+     */
+    async setGroupSongSession(groupId, session) {
+        await redisSetKey(this.getSongInfoRedisKey(groupId), {
+            group_id: groupId,
+            platform: session.platform || "netease",
+            updatedAt: session.updatedAt || Date.now(),
+            data: session.data || [],
+        });
     }
 
     async pickSong(e) {
-        // 判断功能是否开启
+        this.refreshSongRequestConfig();
         if (!this.useNeteaseSongRequest) {
-            logger.info('当前未开启网易云点歌')
+            logger.info('当前未开启点歌功能')
             return false
         }
-        // 获取自定义API
-        const autoSelectNeteaseApi = await this.pickApi()
         // 只在群里可以使用
-        let group_id = e.group_id
+        const group_id = e.group_id
         if (!group_id) return
-        // 初始化
-        let songInfo = await redisGetKey(REDIS_YUNZAI_SONGINFO) || []
-        const saveId = songInfo.findIndex(item => item.group_id === e.group_id)
-        let musicDate = { 'group_id': group_id, data: [] }
-        // 获取搜索歌曲列表信息
-        let detailUrl = autoSelectNeteaseApi + "/song/detail?ids={}&time=" + Date.now() //歌曲详情API
+
         const match = e.msg.match(/^#点歌\s*(.+?)(?:\s+([12]))?$/);
         if (match) {
             const songKeyWord = match[1];
             const songType = match[2] || '1';
-            // 获取云盘歌单列表
-            const cloudSongList = await this.getCloudSong()
-            // 搜索云盘歌单并进行搜索
-            const searchKeyword = songKeyWord.trim().toLowerCase();
-            const matchedSongs = cloudSongList.filter(({ songName, singerName }) => {
-                const nameMatch = songName && songName.toLowerCase().includes(searchKeyword);
-                const singerMatch = singerName && singerName.toLowerCase().includes(searchKeyword);
-                return nameMatch || singerMatch;
-            });
-            // 计算列表数
-            let songListCount = matchedSongs.length >= this.songRequestMaxList ? this.songRequestMaxList : matchedSongs.length
-            let searchCount = this.songRequestMaxList - songListCount
-            for (let i = 0; i < songListCount; i++) {
-                musicDate.data.push({
-                    'id': matchedSongs[i].id,
-                    'songName': matchedSongs[i].songName,
-                    'singerName': matchedSongs[i].singerName,
-                    'duration': matchedSongs[i].duration,
-                    'type': matchedSongs[i].type,
-                    'cover': matchedSongs[i].cover || 'def'
-                });
+            const platformId = this.songRequestPlatform;
+
+            if (platformId === 'kugou' && !this.kugouApiServer) {
+                e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
+                return true;
             }
-            let searchUrl;
-            if (songType === '2') {
-                searchUrl = `${autoSelectNeteaseApi}/search?keywords={}&type=2000&limit=${searchCount}`; // 播客声音接口(暂时只加入播客声音)
-            } else {
-                searchUrl = `${autoSelectNeteaseApi}/search?keywords={}&limit=${searchCount}`; // 歌曲接口
-            }
-            searchUrl = searchUrl.replace("{}", encodeURIComponent(songKeyWord))
-            await axios.get(searchUrl, {
-                headers: {
-                    "User-Agent": COMMON_USER_AGENT
-                },
-            }).then(async res => {
-                const results = songType === '2' ? res.data.data?.resources : res.data.result?.songs;
-                if (results || musicDate.data[0]) {
-                    try {
-                        if (results) {
-                            for (const info of results) {
-                                if (songType === '2') {
-                                    musicDate.data.push({
-                                        'programId': info.baseInfo.id,
-                                        'id': info.baseInfo.mainSong.id,
-                                        'songName': info.baseInfo.mainSong.name,
-                                        'singerName': info.baseInfo.dj.nickname,
-                                        'duration': formatTime(info.baseInfo.duration),
-                                        'cover': info.baseInfo.coverUrl,
-                                        'type': 'podcast'
-                                    });
-                                } else {
-                                    musicDate.data.push({
-                                        'id': info.id,
-                                        'songName': info.name,
-                                        'singerName': info.artists[0]?.name,
-                                        'duration': formatTime(info.duration),
-                                        'type': 'song'
-                                    });
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        logger.info('并未获取云服务歌曲')
-                    }
-                    const songIds = musicDate.data.filter(item => item.type !== 'podcast' && item.type !== 'cloud').map(item => item.id).join(',');
-                    if (songIds) {
-                        detailUrl = detailUrl.replace("{}", songIds)
-                        await axios.get(detailUrl, {
-                            headers: {
-                                "User-Agent": COMMON_USER_AGENT
-                            },
-                        }).then(res => {
-                            let imgList = {};
-                            for (const songDetail of res.data.songs) {
-                                const songId = songDetail.id;
-                                if (songDetail.al.picUrl.includes('109951169484091680.jpg')) {
-                                    imgList[songId] = 'def';
-                                } else {
-                                    imgList[songId] = songDetail.al.picUrl;
-                                }
-                                const musicDataIndex = musicDate.data.findIndex(item => item.id === songId);
-                                if (musicDataIndex !== -1) {
-                                    musicDate.data[musicDataIndex].songName = songDetail.name;
-                                    musicDate.data[musicDataIndex].singerName = songDetail.ar[0]?.name;
-                                }
-                            }
-                            for (let i = 0; i < musicDate.data.length; i++) {
-                                const songId = musicDate.data[i].id;
-                                if (imgList[songId]) {
-                                    musicDate.data[i].cover = imgList[songId];
-                                }
-                            }
-                        })
-                    }
-                    if (saveId == -1) {
-                        songInfo.push(musicDate)
-                    } else {
-                        songInfo[saveId] = musicDate
-                    }
-                    await redisSetKey(REDIS_YUNZAI_SONGINFO, songInfo)
-                    const data = await new PickSongList(e).getData(musicDate.data)
-                    let img = await puppeteer.screenshot("pick-song", data);
-                    e.reply(img);
-                } else {
-                    e.reply('暂未找到你想听的歌哦~')
+
+            try {
+                const adapter = await this.createPlatformAdapter(platformId);
+                if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
+                    e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
+                    return true;
                 }
-            })
-        } else if (await redisGetKey(REDIS_YUNZAI_SONGINFO) != []) {
-            if (e.msg.replace(/\s+/g, "").match(/^#听(\d+)/)) {
-                const pickNumber = e.msg.replace(/\s+/g, "").match(/^#听(\d+)/)[1] - 1
-                let group_id = e.group_id
-                if (!group_id) return
-                let songInfo = await redisGetKey(REDIS_YUNZAI_SONGINFO)
-                const saveId = songInfo.findIndex(item => item.group_id === e.group_id)
-                const selectedSong = songInfo[saveId].data[pickNumber];
-                const songId = selectedSong.id;
-                const songType = selectedSong.type || 'song';
-                const AUTO_NETEASE_SONG_DOWNLOAD = autoSelectNeteaseApi + "/song/url/v1?id={}&level=" + this.neteaseCloudAudioQuality;
-                const pickSongUrl = AUTO_NETEASE_SONG_DOWNLOAD.replace("{}", songId);
-                const songWikiUrl = autoSelectNeteaseApi + '/song/wiki/summary?id=' + songId;
-                const statusUrl = autoSelectNeteaseApi + '/login/status'; //用户状态API
-                // 判断选中的歌曲是否来自云盘
-                const isCloudSong = selectedSong.type === 'cloud';
-                // 检查 Cookie 有效性，根据歌曲来源选择 Cookie 类型
-                const isCkExpired = await this.checkCooike(statusUrl, isCloudSong ? 'cloud' : 'song');
-                // 请求netease数据并播放
-                this.neteasePlay(e, pickSongUrl, songWikiUrl, songInfo[saveId].data, pickNumber, isCkExpired, isCloudSong, songType);
+
+                /** @type {any[]} */
+                let list = [];
+
+                // 云盘混搜仅网易云
+                if (platformId === 'netease') {
+                    const cloudSongList = await this.getCloudSong();
+                    const searchKeyword = songKeyWord.trim().toLowerCase();
+                    const matchedSongs = (cloudSongList || []).filter(({ songName, singerName }) => {
+                        const nameMatch = songName && songName.toLowerCase().includes(searchKeyword);
+                        const singerMatch = singerName && singerName.toLowerCase().includes(searchKeyword);
+                        return nameMatch || singerMatch;
+                    });
+                    const songListCount = Math.min(matchedSongs.length, this.songRequestMaxList);
+                    for (let i = 0; i < songListCount; i++) {
+                        list.push(createSongItem({
+                            platform: 'netease',
+                            sourceType: 'cloud',
+                            id: matchedSongs[i].id,
+                            songName: matchedSongs[i].songName,
+                            singerName: matchedSongs[i].singerName,
+                            duration: matchedSongs[i].duration,
+                            cover: matchedSongs[i].cover || 'def',
+                        }));
+                    }
+                }
+
+                const searchCount = Math.max(0, this.songRequestMaxList - list.length);
+                if (searchCount > 0) {
+                    const searched = await adapter.search(songKeyWord, {
+                        limit: searchCount,
+                        contentType: songType,
+                    });
+                    list = list.concat(searched || []);
+                }
+
+                if (!list.length) {
+                    e.reply('暂未找到你想听的歌哦~');
+                    return true;
+                }
+
+                await this.setGroupSongSession(group_id, {
+                    platform: platformId,
+                    updatedAt: Date.now(),
+                    data: list,
+                });
+
+                const data = await new PickSongList(e).getData(list, platformId);
+                // saveId/tplFile 已按平台切换（酷狗用 pick-song-kugou）
+                let img = await puppeteer.screenshot(data.saveId || "pick-song", data);
+                e.reply(img);
+            } catch (error) {
+                logger.error(`[R插件][点歌][${platformId}] 搜索失败`, error);
+                e.reply(`点歌失败：${error.message || '未知错误'}`);
             }
+            return true;
         }
 
+        // #听N
+        const listenMatch = e.msg.replace(/\s+/g, "").match(/^#听(\d+)/);
+        if (!listenMatch) {
+            return false;
+        }
+        const pickNumber = Number(listenMatch[1]) - 1;
+        try {
+            const session = await this.getGroupSongSession(group_id);
+            if (!session?.data?.length) {
+                e.reply('请先使用 #点歌 搜索后再选择');
+                return true;
+            }
+            const selectedRaw = session.data[pickNumber];
+            if (!selectedRaw) {
+                e.reply('序号超出范围，请重新选择');
+                return true;
+            }
+            const selectedSong = normalizeLegacySongItem(selectedRaw, session.platform || 'netease');
+            if (!selectedSong) {
+                e.reply('歌曲数据异常，请重新点歌');
+                return true;
+            }
+            await this.playSelectedSong(e, selectedSong);
+        } catch (error) {
+            logger.error(`[R插件][点歌][听] 失败`, error);
+            e.reply(`播放失败：${error.message || '未知错误'}`);
+        }
+        return true;
     }
 
     // 播放策略
     async playSong(e) {
+        this.refreshSongRequestConfig();
         if (!this.useNeteaseSongRequest) {
-            logger.info('当前未开启网易云点歌')
+            logger.info('当前未开启点歌功能')
             return
         }
         // 只在群里可以使用
-        let group_id = e.group_id
+        const group_id = e.group_id
         if (!group_id) return
-        const autoSelectNeteaseApi = await this.pickApi()
-        let songInfo = []
-        // 获取搜索歌曲列表信息
-        const AUTO_NETEASE_SONG_DOWNLOAD = autoSelectNeteaseApi + "/song/url/v1?id={}&level=" + this.neteaseCloudAudioQuality;
+
         const match = e.msg.match(/^#播放\s*(.+?)(?:\s+([12]))?$/);
-        if (match) {
-            const songKeyWord = match[1];
-            const songType = match[2] || '1';
-            let searchUrl;
-            if (songType === '2') {
-                searchUrl = `${autoSelectNeteaseApi}/search?keywords={}&type=2000&limit=1`; // 播客声音接口(暂时只加入播客声音)
-            } else {
-                searchUrl = `${autoSelectNeteaseApi}/cloudsearch?keywords={}&limit=1`; // 歌曲接口
+        if (!match) return;
+        const songKeyWord = match[1];
+        const songType = match[2] || '1';
+        const platformId = this.songRequestPlatform;
+        if (platformId === 'kugou' && !this.kugouApiServer) {
+            e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
+            return true;
+        }
+
+        try {
+            const adapter = await this.createPlatformAdapter(platformId);
+            if (songType === '2' && adapter.supportsContentType && !adapter.supportsContentType(songType)) {
+                e.reply(`当前点歌平台「${adapter.displayName}」不支持播客，请切换到网易云或去掉参数 2`);
+                return true;
             }
-            searchUrl = searchUrl.replace("{}", encodeURIComponent(songKeyWord))
-            await axios.get(searchUrl, {
-                headers: {
-                    "User-Agent": COMMON_USER_AGENT
-                },
-            }).then(async res => {
-                const results = songType === '2' ? res.data.data?.resources : res.data.result?.songs;
-                if (results && results.length > 0) {
-                    const info = results[0];
-                    let programId, id, songName, singerName, duration, cover, type;
-                    if (songType === '2') {
-                        programId = info.baseInfo.id
-                        id = info.baseInfo.mainSong.id;
-                        songName = info.baseInfo.mainSong.name;
-                        singerName = info.baseInfo.dj.nickname;
-                        duration = formatTime(info.baseInfo.duration);
-                        cover = info.baseInfo.coverUrl;
-                        type = 'podcast';
-                    } else {
-                        id = info.id;
-                        songName = info.name;
-                        singerName = info.ar[0]?.name;
-                        duration = formatTime(info.dt);
-                        cover = info.al.picUrl;
-                        type = 'song';
-                    }
-                    songInfo.push({ programId, id, songName, singerName, duration, cover, type });
-                    const pickSongUrl = AUTO_NETEASE_SONG_DOWNLOAD.replace("{}", id)
-                    const statusUrl = autoSelectNeteaseApi + '/login/status' //用户状态API
-                    const songWikiUrl = autoSelectNeteaseApi + '/song/wiki/summary?id=' + id;
-                    const isCkExpired = await this.checkCooike(statusUrl, 'song')
-                    this.neteasePlay(e, pickSongUrl, songWikiUrl, songInfo, 0, isCkExpired, false, songType)
-                } else {
-                    e.reply('暂未找到你想听的歌哦~')
-                }
-            })
+            const list = await adapter.search(songKeyWord, {
+                limit: 1,
+                contentType: songType,
+                // 保持历史：#播放 普通歌曲走 cloudsearch
+                useCloudSearch: platformId === 'netease' && songType !== '2',
+            });
+            if (!list?.length) {
+                e.reply('暂未找到你想听的歌哦~');
+                return true;
+            }
+            await this.playSelectedSong(e, list[0]);
+        } catch (error) {
+            logger.error(`[R插件][播放][${platformId}] 失败`, error);
+            e.reply(`播放失败：${error.message || '未知错误'}`);
         }
+        return true;
     }
 
-    formatKugouDuration(duration) {
-        const value = Number(duration);
-        if (!Number.isFinite(value) || value <= 0) {
-            return "";
+    /**
+     * 统一播放选中歌曲（#听 / #播放）
+     * @param e
+     * @param {object} rawSong
+     */
+    async playSelectedSong(e, rawSong) {
+        this.refreshSongRequestConfig();
+        const song = normalizeLegacySongItem(rawSong, rawSong?.platform || this.songRequestPlatform);
+        if (!song) {
+            e.reply('歌曲数据异常，请重新点歌');
+            return;
         }
-        const seconds = value > 10000 ? Math.floor(value / 1000) : Math.floor(value);
-        const minute = String(Math.floor(seconds / 60)).padStart(2, "0");
-        const second = String(seconds % 60).padStart(2, "0");
-        return `${minute}:${second}`;
+        const platformId = normalizeMusicPlatformId(song.platform || this.songRequestPlatform);
+        const isCloudSong = song.sourceType === 'cloud' || song.type === 'cloud';
+
+        let playResult;
+        try {
+            const adapter = await this.createPlatformAdapter(platformId);
+            if (platformId === 'netease') {
+                // 云盘使用云盘 Cookie
+                const cloudCookie = this.neteaseCloudCookie || this.neteaseCookie;
+                playResult = await adapter.resolve(song, {
+                    cookie: isCloudSong ? cloudCookie : this.neteaseCookie,
+                    cloudCookie,
+                    isCloudSong,
+                    quality: this.neteaseCloudAudioQuality,
+                });
+            } else {
+                playResult = await adapter.resolve(song, {
+                    cookie: this.kugouCookie,
+                    quality: this.kugouAudioQuality,
+                });
+            }
+        } catch (error) {
+            logger.error(`[R插件][播放][${platformId}] resolve 失败`, error);
+            e.reply(`获取音源失败：${error.message || '未知错误'}`);
+            return;
+        }
+
+        for (const warning of playResult?.warnings || []) {
+            logger.warn(`[R插件][播放][${platformId}] ${warning}`);
+        }
+        await this.sendPlayResult(e, song, playResult);
     }
 
-    buildKugouPickItem(item = {}) {
-        const singerName = item.authorName || "未知歌手";
-        let songName = item.songName || item.audioName || "未知歌曲";
-        const singerPrefixReg = new RegExp(`^${String(singerName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[-–—_]\\s*`);
-        songName = songName.replace(singerPrefixReg, "").trim() || songName;
-        return {
-            id: item.hash,
-            hash: item.hash,
-            albumId: item.albumId || "",
-            albumAudioId: item.albumAudioId || "",
-            songName,
-            singerName,
-            duration: this.formatKugouDuration(item.duration),
-            cover: item.cover || "def",
-            type: "kugou",
-            cookie: item.cookie || this.kugouCookie || "",
+    /**
+     * 发送播放结果：信息卡 + 音乐卡 + 文件/语音兜底
+     */
+    async sendPlayResult(e, song, playResult = {}) {
+        const title = [song.singerName, song.songName].filter(Boolean).join('-') || song.songName || '未知歌曲';
+        const musicInfo = {
+            cover: playResult.cover || song.cover || 'def',
+            songName: song.songName,
+            singerName: song.singerName,
+            size: playResult.size || playResult.qualityLabel || '',
+            musicType: playResult.tags?.length ? playResult.tags : [song.platform || 'music'],
         };
-    }
 
-    async searchKugouPickList(keyword) {
-        if (!this.kugouApiServer) {
-            throw new Error("未配置酷狗开源API地址，请先填写 tools.kugouApiServer");
+        try {
+            const data = await new NeteaseMusicInfo(e).getData(musicInfo);
+            const img = await puppeteer.screenshot("neteaseMusicInfo", data);
+            await e.reply(img);
+        } catch (error) {
+            logger.warn(`[R插件][播放] 信息卡截图失败: ${error.message}`);
         }
-        const list = await searchKugouSongList(
-            this.kugouApiServer,
-            keyword,
-            this.kugouCookie,
-            this.songRequestMaxList
-        );
-        return list.map(item => this.buildKugouPickItem(item));
+
+        let cardSentSuccessfully = false;
+        try {
+            const card = playResult.card;
+            // 原生卡不依赖本地音源 URL（协议端自行拉流）
+            if (card?.kind === 'native' && card.id != null) {
+                try {
+                    await sendMusicCard(e, card.platformType || '163', card.id);
+                    cardSentSuccessfully = true;
+                } catch (nativeErr) {
+                    // 酷狗原生卡失败时，若有音频 URL 再退 custom
+                    logger.warn(`[R插件][播放] 原生卡片失败(${card.platformType}:${card.id}): ${nativeErr.message}`);
+                    if (card.audioUrl || playResult.url) {
+                        const audioUrl = card.audioUrl || playResult.url;
+                        await sendCustomMusicCard(
+                            e,
+                            card.pageUrl || audioUrl,
+                            audioUrl,
+                            card.title || song.songName || title,
+                            card.image || musicInfo.cover,
+                            card.musicType || 'custom',
+                            card.content || song.singerName || '',
+                        );
+                        cardSentSuccessfully = true;
+                    } else {
+                        throw nativeErr;
+                    }
+                }
+            } else if (card?.kind === 'custom' && (card.audioUrl || playResult.url)) {
+                const audioUrl = card.audioUrl || playResult.url;
+                await sendCustomMusicCard(
+                    e,
+                    card.pageUrl || audioUrl,
+                    audioUrl,
+                    card.title || title,
+                    card.image || musicInfo.cover,
+                    card.musicType || 'custom',
+                    card.content || song.singerName || '',
+                );
+                cardSentSuccessfully = true;
+            }
+        } catch (error) {
+            if (error.message) {
+                logger.error("发送卡片错误:", error.message, '将尝试发送文件/语音');
+            } else {
+                logger.error("发送卡片错误，请查看控制台报错，将尝试发送文件/语音");
+                logger.error(error);
+            }
+            cardSentSuccessfully = false;
+        }
+
+        if (!playResult.url) {
+            if (!cardSentSuccessfully) {
+                e.reply('未获取到可播放音源，请检查 Cookie / API / 会员权限');
+            }
+            return;
+        }
+
+        const musicExt = playResult.audioType || 'mp3';
+        FileSuffix = musicExt;
+        // 点歌成功后固定发送群文件和语音；音乐卡片失败时也继续作为兜底
+        try {
+            const path = await downloadAudio(playResult.url, this.getCurDownloadPath(e), title, 'follow', musicExt);
+            try {
+                await this.uploadGroupFile(e, path);
+                if (musicExt !== 'mp4' && this.isSendVocal) {
+                    await e.reply(segment.record(path));
+                }
+            } finally {
+                await checkAndRemoveFile(path);
+            }
+        } catch (err) {
+            logger.error(`下载音乐失败，错误信息为: ${err}`);
+            if (!cardSentSuccessfully) {
+                e.reply('音频下载失败，请稍后重试');
+            }
+        }
     }
 
     async pickKugouSong(e) {
+        this.refreshSongRequestConfig();
         if (!this.useNeteaseSongRequest) {
             logger.info('当前未开启点歌功能')
             return false
         }
         if (!e.group_id) return
+        if (!this.kugouApiServer) {
+            e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
+            return true;
+        }
 
-        const listenMatch = e.msg.replace(/\s+/g, "").match(/^#?(?:酷狗|kg|KG)听(\d+)$/);
+        const listenMatch = e.msg.replace(/\s+/g, '').match(/^#?(?:酷狗|kg|KG)听(\d+)$/);
         if (listenMatch) {
             const pickNumber = Number(listenMatch[1]) - 1;
-            const songInfo = await redisGetKey(REDIS_YUNZAI_KUGOU_SONGINFO) || [];
-            const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
-            const selectedSong = songInfo?.[saveId]?.data?.[pickNumber];
+            const session = await this.getGroupSongSession(e.group_id);
+            const selectedRaw = session?.platform === 'kugou' ? session.data?.[pickNumber] : null;
+            const selectedSong = normalizeLegacySongItem(selectedRaw, 'kugou');
             if (!selectedSong) {
-                e.reply("没有找到这首酷狗歌曲，请先发送 #酷狗点歌 歌名");
+                e.reply('没有找到这首酷狗歌曲，请先发送 #酷狗点歌 歌名');
                 return true;
             }
-            await this.kugouPlay(e, selectedSong);
+            await this.playSelectedSong(e, selectedSong);
             return true;
         }
 
@@ -378,100 +499,55 @@ export class songRequest extends plugin {
         if (!keyword) return false;
 
         try {
-            const data = await this.searchKugouPickList(keyword);
-            if (!data.length) {
-                e.reply("暂未在酷狗找到你想听的歌哦~");
+            const adapter = await this.createPlatformAdapter('kugou');
+            const data = await adapter.search(keyword, { limit: this.songRequestMaxList });
+            if (!data?.length) {
+                e.reply('暂未在酷狗找到你想听的歌哦~');
                 return true;
             }
-
-            const songInfo = await redisGetKey(REDIS_YUNZAI_KUGOU_SONGINFO) || [];
-            const saveId = songInfo.findIndex(item => item.group_id === e.group_id);
-            const musicDate = { group_id: e.group_id, data };
-            if (saveId === -1) {
-                songInfo.push(musicDate);
-            } else {
-                songInfo[saveId] = musicDate;
-            }
-            await redisSetKey(REDIS_YUNZAI_KUGOU_SONGINFO, songInfo);
-
-            const renderData = await new PickSongList(e).getData(data);
-            const img = await puppeteer.screenshot("pick-song", renderData);
+            await this.setGroupSongSession(e.group_id, {
+                platform: 'kugou',
+                updatedAt: Date.now(),
+                data,
+            });
+            const renderData = await new PickSongList(e).getData(data, 'kugou');
+            const img = await puppeteer.screenshot(renderData.saveId || 'pick-song-kugou', renderData);
             await e.reply(img);
         } catch (error) {
-            logger.error("[R插件][酷狗点歌] 搜索失败", error);
+            logger.error('[R插件][酷狗点歌] 搜索失败', error);
             e.reply(`酷狗点歌搜索失败：${error.message || error}`);
         }
         return true;
     }
 
     async playKugouSong(e) {
+        this.refreshSongRequestConfig();
         if (!this.useNeteaseSongRequest) {
             logger.info('当前未开启点歌功能')
             return false
         }
         if (!e.group_id) return
+        if (!this.kugouApiServer) {
+            e.reply('未配置酷狗 API 地址，请先在锅巴 / tools.yaml 填写 kugouApiServer');
+            return true;
+        }
 
         const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\s*(.+)$/);
         const keyword = match?.[1]?.trim();
         if (!keyword) return false;
 
         try {
-            const data = await this.searchKugouPickList(keyword);
-            if (!data.length) {
-                e.reply("暂未在酷狗找到你想听的歌哦~");
+            const adapter = await this.createPlatformAdapter('kugou');
+            const data = await adapter.search(keyword, { limit: 1 });
+            if (!data?.length) {
+                e.reply('暂未在酷狗找到你想听的歌哦~');
                 return true;
             }
-            await this.kugouPlay(e, data[0]);
+            await this.playSelectedSong(e, data[0]);
         } catch (error) {
-            logger.error("[R插件][酷狗播放] 失败", error);
+            logger.error('[R插件][酷狗播放] 失败', error);
             e.reply(`酷狗播放失败：${error.message || error}`);
         }
-        return true;
-    }
-
-    async kugouPlay(e, song) {
-        if (!this.kugouApiServer) {
-            e.reply("未配置酷狗开源API地址，请先填写 tools.kugouApiServer");
-            return true;
-        }
-        const urlResult = await getKugouSongUrl(this.kugouApiServer, {
-            hash: song.hash || song.id,
-            albumId: song.albumId || "",
-            albumAudioId: song.albumAudioId || "",
-            cookie: song.cookie || this.kugouCookie,
-            quality: this.kugouAudioQuality,
-        });
-        if (!urlResult.url) {
-            e.reply(`未从酷狗 API 获取到可用音源：${urlResult.error || "请检查酷狗 Cookie 或歌曲权限"}`);
-            return true;
-        }
-
-        const cardData = await new NeteaseMusicInfo(e).getData({
-            cover: urlResult.cover || song.cover,
-            songName: song.songName,
-            singerName: song.singerName,
-            size: urlResult.size || urlResult.qualityLabel,
-            musicType: ["酷狗音乐", urlResult.qualityLabel].filter(Boolean)
-        });
-        const img = await puppeteer.screenshot("neteaseMusicInfo", cardData);
-        await e.reply(img);
-
-        const fileName = cleanFilename(`${song.singerName}-${song.songName}`) || `kugou_${String(song.hash || song.id).slice(0, 8)}`;
-        await downloadAudio(urlResult.url, this.getCurDownloadPath(e), fileName, 'follow', urlResult.audioType)
-            .then(async path => {
-                try {
-                    if (urlResult.audioType !== 'mp4' && this.isSendVocal) {
-                        await e.reply(segment.record(path));
-                    }
-                    await this.uploadGroupFile(e, path);
-                } finally {
-                    await checkAndRemoveFile(path);
-                }
-            })
-            .catch(err => {
-                logger.error(`下载酷狗音乐失败，错误信息为: ${err.message || err}`);
-                e.reply(`下载酷狗音乐失败：${err.message || err}`);
-            });
         return true;
     }
 
@@ -976,16 +1052,18 @@ export class songRequest extends plugin {
             // 下载音乐
             downloadAudio(url, this.getCurDownloadPath(e), title, 'follow', musicExt)
                 .then(async path => {
-                    try {
-                        // 点歌成功后固定发送群文件；卡片失败时也继续作为兜底
-                        await this.uploadGroupFile(e, path);
-                        // 发送语音
-                        if (musicExt != 'mp4' && this.isSendVocal) {
-                            await e.reply(segment.record(path));
+                    if (!cardSentSuccessfully) {
+                        try {
+                            // 发送群文件
+                            await this.uploadGroupFile(e, path);
+                            // 发送语音
+                            if (musicExt != 'mp4' && this.isSendVocal) {
+                                await e.reply(segment.record(path));
+                            }
+                        } finally {
+                            // 删除文件
+                            await checkAndRemoveFile(path);
                         }
-                    } finally {
-                        // 删除文件
-                        await checkAndRemoveFile(path);
                     }
                 })
                 .catch(err => {
