@@ -478,7 +478,7 @@ export class songRequest extends plugin {
             return true;
         }
 
-        const match = e.msg.match(/^#?(?:酷狗|kg|KG)点歌\s*(.+)$/);
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)点歌\\s*(.+)$/);
         const keyword = match?.[1]?.trim();
         if (!keyword) return false;
 
@@ -516,7 +516,7 @@ export class songRequest extends plugin {
         }
         if (!e.group_id) return
 
-        const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\s*(.+)$/);
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\\s*(.+)$/);
         const keyword = match?.[1]?.trim();
         if (!keyword) return false;
 
