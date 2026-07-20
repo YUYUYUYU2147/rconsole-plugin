@@ -38,6 +38,14 @@ export class songRequest extends plugin {
                     fnc: "playSong"
                 },
                 {
+                    reg: "^#?(?:酷狗|kg|KG)点歌\\s*(.+)$|^#?(?:酷狗|kg|KG)听[1-9][0-9]*$",
+                    fnc: "pickKugouSong"
+                },
+                {
+                    reg: "^#?(?:酷狗|kg|KG)播放\\s*(.+)$",
+                    fnc: "playKugouSong"
+                },
+                {
                     reg: "^#?上传$",
                     fnc: "upLoad"
                 },
@@ -494,7 +502,7 @@ export class songRequest extends plugin {
             return true;
         }
 
-        const match = e.msg.match(/^#?(?:酷狗|kg|KG)点歌\s*(.+)$/);
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)点歌\\s*(.+)$/);
         const keyword = match?.[1]?.trim();
         if (!keyword) return false;
 
@@ -532,7 +540,7 @@ export class songRequest extends plugin {
             return true;
         }
 
-        const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\s*(.+)$/);
+        const match = e.msg.match(/^#?(?:酷狗|kg|KG)播放\\s*(.+)$/);
         const keyword = match?.[1]?.trim();
         if (!keyword) return false;
 
