@@ -252,7 +252,8 @@ export class tools extends plugin {
                     fnc: "acfun",
                 },
                 {
-                    reg: "(xhslink.com|xiaohongshu.com)",
+                    // 兼容新版短链 xhslink.cn（旧版为 xhslink.com）
+                    reg: "(xhslink\\.(com|cn)|xiaohongshu\\.com)",
                     fnc: "xhs",
                 },
                 {
@@ -2681,72 +2682,116 @@ export class tools extends plugin {
             logger.info(`[R插件][全局解析控制] ${RESOLVE_CONTROLLER_NAME_ENUM.xhs} 已拦截`);
             return false;
         }
-        // 正则说明：匹配手机链接、匹配小程序、匹配PC链接
+        // 正则说明：匹配手机短链（xhslink.com / xhslink.cn）、小程序、PC 链接
+        // 注意：新版分享短链已切到 xhslink.cn，旧规则只写了 .com 会导致完全不进 xhs()
+        const msgText = String(e.msg ?? "").trim().replaceAll("amp;", "");
+        const cardData = e?.message?.[0]?.data;
         let msgUrl =
-            /(http:|https:)\/\/(xhslink|xiaohongshu).com\/[A-Za-z\d._?%&+\-=\/#@]*/.exec(
-                e.msg,
+            /(https?:)\/\/(xhslink\.(?:com|cn)|(?:www\.)?xiaohongshu\.com)\/[A-Za-z\d._?%&+\-=\/#@]*/i.exec(
+                msgText,
             )?.[0]
-            || /(http:|https:)\/\/www\.xiaohongshu\.com\/discovery\/item\/(\w+)/.exec(
-                e.message[0].data,
-            )?.[0]
-            || /(http:|https:)\/\/www\.xiaohongshu\.com\/explore\/(\w+)/.exec(
-                e.msg,
-            )?.[0]
-            || /(http:|https:)\/\/www\.xiaohongshu\.com\/discovery\/item\/(\w+)/.exec(
-                e.msg,
-            )?.[0];
+            || (typeof cardData === "string"
+                ? /(https?:)\/\/(xhslink\.(?:com|cn)|(?:www\.)?xiaohongshu\.com)\/[A-Za-z\d._?%&+\-=\/#@]*/i.exec(
+                    cardData,
+                )?.[0]
+                : undefined);
+
+        if (!msgUrl) {
+            logger.info("[R插件][xhs] 无法从消息中提取小红书链接");
+            return false;
+        }
+        logger.info(`[R插件][xhs] 识别到链接: ${msgUrl}`);
+
         // 注入ck
         XHS_NO_WATERMARK_HEADER.cookie = this.xiaohongshuCookie;
-        // 解析短号
+        // 解析短号 / 笔记参数
         let id, xsecToken, xsecSource;
         if (msgUrl.includes("xhslink")) {
-            await fetch(msgUrl, {
-                headers: XHS_NO_WATERMARK_HEADER,
-                redirect: "follow",
-            }).then(resp => {
-                const uri = decodeURIComponent(resp.url);
-                const parsedUrl = new URL(resp.url);
-                // 如果出现了网页验证uri:https://www.xiaohongshu.com/website-login/captcha?redirectPath=https://www.xiaohongshu.com/discovery/item/63c93ac3000000002203b28a?app_platform=android&app_version=8.23.1&author_share=1&ignoreEngage=true&share_from_user_hidden=true&type=normal&xhsshare=CopyLink&appuid=62c58b90000000000303dc54&apptime=1706149572&exSource=&verifyUuid=a5f32b62-453e-426b-98fe-2cfe0c16776d&verifyType=102&verifyBiz=461
-                const verify = uri.match(/\/item\/([0-9a-fA-F]+)/);
-                // 一般情况下不会出现问题就使用这个正则
-                id = /noteId=(\w+)/.exec(uri)?.[1] ?? verify?.[1];
-                // 提取 xsec_source 和 xsec_token 参数
+            try {
+                const resp = await fetch(msgUrl, {
+                    headers: XHS_NO_WATERMARK_HEADER,
+                    redirect: "follow",
+                });
+                const finalUrl = resp.url || msgUrl;
+                const uri = decodeURIComponent(finalUrl);
+                const parsedUrl = new URL(finalUrl);
+                logger.info(`[R插件][xhs] 短链跳转: ${finalUrl}`);
+                // captcha 场景下 noteId 常在 redirectPath 里：/item/{id} 或 noteId=
+                const verify = uri.match(/\/(?:item|explore)\/([0-9a-fA-F]+)/i);
+                id = /noteId=(\w+)/i.exec(uri)?.[1] ?? verify?.[1];
+                // 提取 xsec_source 和 xsec_token；短链有时会丢参，以后续校验为准
                 xsecSource = parsedUrl.searchParams.get("xsec_source") || "pc_feed";
                 xsecToken = parsedUrl.searchParams.get("xsec_token");
-            });
-        } else {
-            // 新版 xhs 这里必须是e.msg.trim()，因为要匹配参数：xsec_source 和 xsec_token
-            const xhsUrlMatch = e.msg.trim().replace("amp;", "").match(/(http|https)?:\/\/(www\.)?xiaohongshu\.com[^\s]+/);
-            if (!xhsUrlMatch) {
-                logger.info("[R插件][xhs] 无法匹配到链接");
-                return;
+                // 若跳转到 captcha，再从 redirectPath 里补一次参数
+                if ((!xsecToken || !id) && parsedUrl.pathname.includes("captcha")) {
+                    const redirectPath = parsedUrl.searchParams.get("redirectPath");
+                    if (redirectPath) {
+                        try {
+                            const redirectUrl = new URL(redirectPath, "https://www.xiaohongshu.com");
+                            id = id || /\/(?:item|explore)\/([0-9a-fA-F]+)/i.exec(redirectUrl.pathname)?.[1];
+                            xsecToken = xsecToken || redirectUrl.searchParams.get("xsec_token");
+                            xsecSource = redirectUrl.searchParams.get("xsec_source") || xsecSource || "pc_feed";
+                        } catch (err) {
+                            logger.warn(`[R插件][xhs] 解析 captcha redirectPath 失败: ${err.message}`);
+                        }
+                    }
+                }
+            } catch (err) {
+                logger.error(`[R插件][xhs] 短链跳转失败: ${err.message}`);
+                e.reply(`小红书短链解析失败，请稍后重试或换一条链接\n${HELP_DOC}`);
+                return false;
             }
-            const parsedUrl = new URL(xhsUrlMatch[0]);
-            id = /explore\/(\w+)/.exec(msgUrl)?.[1] || /discovery\/item\/(\w+)/.exec(msgUrl)?.[1];
-            // 提取 xsec_source 和 xsec_token 参数
+        } else {
+            // 新版 xhs 需要保留原链上的 xsec_source / xsec_token
+            let parsedUrl;
+            try {
+                parsedUrl = new URL(msgUrl);
+            } catch (err) {
+                logger.info(`[R插件][xhs] 链接解析失败: ${err.message}, url=${msgUrl}`);
+                return false;
+            }
+            id = /\/(?:explore|discovery\/item)\/([0-9a-fA-F]+)/i.exec(parsedUrl.pathname)?.[1];
             xsecSource = parsedUrl.searchParams.get("xsec_source") || "pc_feed";
             xsecToken = parsedUrl.searchParams.get("xsec_token");
         }
+
         const downloadPath = `${this.getCurDownloadPath(e)}`;
-        // 检测没有 cookie 则退出
+        // 缺参时记明确日志，避免“没反应也不报错”
         if (_.isEmpty(this.xiaohongshuCookie) || _.isEmpty(id) || _.isEmpty(xsecToken) || _.isEmpty(xsecSource)) {
+            logger.info(`[R插件][xhs] 参数不完整 cookie=${!_.isEmpty(this.xiaohongshuCookie)} id=${id || "-"} xsec_token=${xsecToken ? "yes" : "no"} xsec_source=${xsecSource || "-"}`);
             e.reply(`请检查以下问题：\n1. 是否填写 Cookie\n2. 链接是否有id\n3. 链接是否有 xsec_token 和 xsec_source\n${HELP_DOC}`);
-            return;
+            return false;
         }
+
+        logger.info(`[R插件][xhs] 请求笔记 id=${id}`);
         // 获取信息
-        const resp = await fetch(`${XHS_REQ_LINK}${id}?xsec_token=${xsecToken}&xsec_source=${xsecSource}`, {
+        const resp = await fetch(`${XHS_REQ_LINK}${id}?xsec_token=${encodeURIComponent(xsecToken)}&xsec_source=${encodeURIComponent(xsecSource)}`, {
             headers: XHS_NO_WATERMARK_HEADER,
         });
         // 从网页获取数据
         const xhsHtml = await resp.text();
         const reg = /window\.__INITIAL_STATE__=(.*?)<\/script>/;
-        const res = xhsHtml.match(reg)[1].replace(/undefined/g, "null");
-        const resJson = JSON.parse(res);
+        const matchedState = xhsHtml.match(reg);
+        if (!matchedState?.[1]) {
+            logger.warn(`[R插件][xhs] 页面未找到 __INITIAL_STATE__，status=${resp.status} htmlLen=${xhsHtml.length}`);
+            e.reply(`小红书页面数据解析失败，可能被验证或 Cookie 失效\n${HELP_DOC}`);
+            return false;
+        }
+        const res = matchedState[1].replace(/undefined/g, "null");
+        let resJson;
+        try {
+            resJson = JSON.parse(res);
+        } catch (err) {
+            logger.error(`[R插件][xhs] __INITIAL_STATE__ JSON 解析失败: ${err.message}`);
+            e.reply(`小红书数据解析失败，请稍后重试\n${HELP_DOC}`);
+            return false;
+        }
         // saveJsonToFile(resJson);
-        // 检测无效 Cookie
+        // 检测无效 Cookie / 笔记不可见
         if (resJson?.note === undefined || resJson?.note?.noteDetailMap?.[id]?.note === undefined) {
+            logger.info(`[R插件][xhs] noteDetailMap 缺失 id=${id} noteKeys=${Object.keys(resJson?.note?.noteDetailMap || {}).join(",") || "-"}`);
             e.reply(`检测到无效的小红书 Cookie，可以尝试清除缓存和cookie 或者 换一个浏览器进行获取\n${HELP_DOC}`);
-            return;
+            return false;
         }
         // 提取出数据
         const noteData = resJson?.note?.noteDetailMap?.[id]?.note;
